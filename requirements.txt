@@ -1,0 +1,17 @@
+# Requirements for skeleton_metric-api service
+# Use unpinned package names by default to reduce version conflict risk.
+# Pin a specific version only when absolutely necessary.
+
+fastapi
+uvicorn
+numpy
+pandas
+pyyaml
+# Use headless OpenCV in container environments. For local GUI development you may
+# prefer `opencv-python` instead of `opencv-python-headless`.
+opencv-python-headless
+
+boto3
+
+# for stgcn-api request
+requests
