@@ -41,66 +41,25 @@ import sys
 from pathlib import Path
 sys.path.append(str(Path(__file__).parent))
 from utils_io import natural_key, ensure_dir
+from runner_utils import (
+    parse_joint_axis_map_from_columns,
+    is_dataframe_3d,
+    get_xyz_cols,
+    get_xy_cols_2d,
+    get_xyc_row,
+    scale_xy_for_overlay,
+    compute_overlay_range,
+    write_df_csv,
+    images_to_mp4,
+    upload_overlay_to_s3,
+    normalize_result,
+)
 
 # =========================================================
 # 공통 유틸리티/매핑 함수들 (유연한 헤더 지원)
+# 참고: 다음 함수들은 runner_utils.py에서 임포트합니다
+# - parse_joint_axis_map_from_columns(): 컬럼명 매핑
 # =========================================================
-def parse_joint_axis_map_from_columns(columns, prefer_2d: bool = False) -> Dict[str, Dict[str, str]]:
-    cols = list(columns)
-    mapping: Dict[str, Dict[str, str]] = {}
-    if prefer_2d:
-        axis_patterns = [
-            ('_x', '_y', '_z'),
-            ('__x', '__y', '__z'),
-            ('_X', '_Y', '_Z'),
-            ('_X3D', '_Y3D', '_Z3D'),
-        ]
-    else:
-        axis_patterns = [
-            ('_X3D', '_Y3D', '_Z3D'),
-            ('__x', '__y', '__z'),
-            ('_X', '_Y', '_Z'),
-            ('_x', '_y', '_z'),
-        ]
-    col_set = set(cols)
-    for col in cols:
-        if col.lower() in ('frame', 'time', 'timestamp'):
-            continue
-        for x_pat, y_pat, z_pat in axis_patterns:
-            if col.endswith(x_pat):
-                joint = col[:-len(x_pat)]
-                x_col = joint + x_pat
-                y_col = joint + y_pat
-                z_col = joint + z_pat
-                if x_col in col_set and y_col in col_set:
-                    mapping.setdefault(joint, {})['x'] = x_col
-                    mapping.setdefault(joint, {})['y'] = y_col
-                    if z_col in col_set:
-                        mapping[joint]['z'] = z_col
-                    break
-    return mapping
-
-def get_xyz_cols(df: pd.DataFrame, name: str):
-    cols_map = parse_joint_axis_map_from_columns(df.columns, prefer_2d=False)
-    if name in cols_map and all(a in cols_map[name] for a in ('x','y','z')):
-        m = cols_map[name]
-        return df[[m['x'], m['y'], m['z']]].astype(float).to_numpy()
-    return np.full((len(df), 3), np.nan, dtype=float)
-
-def get_xy_cols_2d(df: pd.DataFrame, name: str) -> np.ndarray:
-    """지정한 관절의 2D(x,y) 시계열을 반환. 없으면 NaN으로 채움"""
-    cols_map = parse_joint_axis_map_from_columns(df.columns, prefer_2d=True)
-    if name in cols_map and all(a in cols_map[name] for a in ('x','y')):
-        m = cols_map[name]
-        return df[[m['x'], m['y']]].astype(float).to_numpy()
-    return np.full((len(df), 2), np.nan, dtype=float)
-
-def get_xyc_row(row: pd.Series, name: str):
-    """관절의 2D 좌표 추출 (신뢰도는 1.0 고정)"""
-    cols_map = parse_joint_axis_map_from_columns(row.index, prefer_2d=True)
-    x = row.get(cols_map.get(name, {}).get('x',''), np.nan)
-    y = row.get(cols_map.get(name, {}).get('y',''), np.nan)
-    return x, y, 1.0
 
 def speed_3d(points_xyz, fps):
     """

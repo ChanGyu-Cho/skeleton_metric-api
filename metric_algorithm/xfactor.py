@@ -35,9 +35,17 @@ except ImportError:
 import sys
 sys.path.append(str(Path(__file__).parent))
 from utils_io import natural_key, ensure_dir
+from runner_utils import (
+    parse_joint_axis_map_from_columns,
+    is_dataframe_3d,
+    get_xyz_cols,
+    write_df_csv,
+    normalize_result,
+)
 
 # =========================================================
 # 공통: 컬럼 매핑/좌표 접근 유틸
+# 참고: parse_joint_axis_map_from_columns는 runner_utils.py에서 임포트
 # =========================================================
 def load_cfg(p: Path):
     if p.suffix.lower() in (".yml", ".yaml"):
@@ -45,41 +53,6 @@ def load_cfg(p: Path):
             raise RuntimeError("pip install pyyaml")
         return yaml.safe_load(p.read_text(encoding="utf-8"))
     raise ValueError("Use YAML for analyze config.")
-
-def parse_joint_axis_map_from_columns(columns, prefer_2d: bool = False) -> Dict[str, Dict[str, str]]:
-    cols = list(columns)
-    mapping: Dict[str, Dict[str, str]] = {}
-    if prefer_2d:
-        axis_patterns = [
-            ('_x', '_y', '_z'),
-            ('__x', '__y', '__z'),
-            ('_X', '_Y', '_Z'),
-            ('_X3D', '_Y3D', '_Z3D'),
-        ]
-    else:
-        axis_patterns = [
-            ('_X3D', '_Y3D', '_Z3D'),
-            ('__x', '__y', '__z'),
-            ('_X', '_Y', '_Z'),
-            ('_x', '_y', '_z'),
-        ]
-    col_set = set(cols)
-    for col in cols:
-        if col.lower() in ('frame', 'time', 'timestamp'):
-            continue
-        for x_pat, y_pat, z_pat in axis_patterns:
-            if col.endswith(x_pat):
-                joint = col[:-len(x_pat)]
-                x_col = joint + x_pat
-                y_col = joint + y_pat
-                z_col = joint + z_pat
-                if x_col in col_set and y_col in col_set:
-                    mapping.setdefault(joint, {})['x'] = x_col
-                    mapping.setdefault(joint, {})['y'] = y_col
-                    if z_col in col_set:
-                        mapping[joint]['z'] = z_col
-                    break
-    return mapping
 
 def get_xyz_row(row: pd.Series, name: str):
     cols_map = parse_joint_axis_map_from_columns(row.index, prefer_2d=False)
@@ -90,28 +63,6 @@ def get_xyz_row(row: pd.Series, name: str):
         y = row.get(m.get('y', ''), np.nan)
         z = row.get(m.get('z', ''), np.nan)
     return np.array([x, y, z], dtype=float)
-
-def get_xyz_cols(df: pd.DataFrame, name: str) -> np.ndarray:
-    cmap = parse_joint_axis_map_from_columns(df.columns, prefer_2d=False)
-    m = cmap.get(name, {})
-    cx, cy, cz = m.get('x'), m.get('y'), m.get('z')
-    if cx in df.columns and cy in df.columns and cz in df.columns:
-        return df[[cx, cy, cz]].astype(float).to_numpy()
-    # fallback to strict X3D headers
-    cols = [f"{name}_X3D", f"{name}_Y3D", f"{name}_Z3D"]
-    if all(c in df.columns for c in cols):
-        return df[cols].astype(float).to_numpy()
-    return np.full((len(df), 3), np.nan, dtype=float)
-
-def get_xyc_row(row: pd.Series, name: str):
-    cols_map = parse_joint_axis_map_from_columns(row.index, prefer_2d=True)
-    x = y = np.nan
-    if name in cols_map:
-        m = cols_map[name]
-        x = row.get(m.get('x', ''), np.nan)
-        y = row.get(m.get('y', ''), np.nan)
-    c = 1.0
-    return x, y, c
 
 
 def _safe_num_to_python(x):

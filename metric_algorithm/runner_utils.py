@@ -471,10 +471,208 @@ def transcode_mp4_to_h264(path: str, crf: int = 23, preset: str = 'fast', timeou
 
 
 # ---------------------------------------------------------------------------
+# 공통 유틸 함수들 (메트릭 모듈에서 중복 사용)
+# ---------------------------------------------------------------------------
+
+def parse_joint_axis_map_from_columns(columns, prefer_2d: bool = False) -> Dict[str, Dict[str, str]]:
+    """관절명과 axis별 컬럼명을 매핑합니다.
+    
+    반환값 예시: {'Nose': {'x':'Nose__x','y':'Nose__y','z':'Nose__z'}, ...}
+    
+    지원 패턴:
+      - Joint__x, Joint__y, Joint__z (더블 언더스코어, 우선)
+      - Joint_X3D, Joint_Y3D, Joint_Z3D (3D 명시)
+      - Joint_X, Joint_Y, Joint_Z (싱글 언더스코어)
+      - Joint_x, Joint_y, Joint_z (소문자)
+    """
+    cols = list(columns)
+    mapping: Dict[str, Dict[str, str]] = {}
+    
+    # 패턴 우선순위 (prefer_2d=False인 경우 3D 우선)
+    if prefer_2d:
+        axis_patterns = [
+            ('_x', '_y', '_z'),
+            ('__x', '__y', '__z'),
+            ('_X', '_Y', '_Z'),
+            ('_X3D', '_Y3D', '_Z3D'),
+        ]
+    else:
+        axis_patterns = [
+            ('_X3D', '_Y3D', '_Z3D'),
+            ('__x', '__y', '__z'),
+            ('_X', '_Y', '_Z'),
+            ('_x', '_y', '_z'),
+        ]
+    
+    col_set = set(cols)
+    for col in cols:
+        if col.lower() in ('frame', 'time', 'timestamp'):
+            continue
+        for x_pat, y_pat, z_pat in axis_patterns:
+            if col.endswith(x_pat):
+                joint = col[:-len(x_pat)]
+                x_col = joint + x_pat
+                y_col = joint + y_pat
+                z_col = joint + z_pat
+                if x_col in col_set and y_col in col_set:
+                    mapping.setdefault(joint, {})['x'] = x_col
+                    mapping.setdefault(joint, {})['y'] = y_col
+                    if z_col in col_set:
+                        mapping[joint]['z'] = z_col
+                    break
+    
+    return mapping
+
+
+def is_dataframe_3d(df: _pd.DataFrame) -> bool:
+    """DataFrame이 3D(Z축 포함) 좌표를 가지는지 판단"""
+    cols_map = parse_joint_axis_map_from_columns(df.columns, prefer_2d=False)
+    # Z 좌표가 있는 관절 찾기
+    for _, axes in cols_map.items():
+        if 'x' in axes and 'y' in axes and 'z' in axes:
+            return True
+    # 추가 확인: Z 컬럼 직접 검색
+    cols_lower = [c.lower() for c in df.columns]
+    for c in cols_lower:
+        if '__z' in c or '_z3d' in c or '_Z3D' in c:
+            return True
+    return False
+
+
+def get_xyz_cols(df: _pd.DataFrame, name: str) -> Optional[_np.ndarray]:
+    """지정한 관절의 3D 좌표(X,Y,Z) 추출 → (N,3) numpy array"""
+    cols_map = parse_joint_axis_map_from_columns(df.columns, prefer_2d=False)
+    if name in cols_map and all(a in cols_map[name] for a in ('x', 'y', 'z')):
+        m = cols_map[name]
+        try:
+            arr = df[[m['x'], m['y'], m['z']]].astype(float).to_numpy()
+            return arr
+        except Exception:
+            pass
+    return None
+
+
+def get_xy_cols_2d(df: _pd.DataFrame, name: str) -> Optional[_np.ndarray]:
+    """지정한 관절의 2D 좌표(x,y) 추출 → (N,2) numpy array"""
+    cols_map = parse_joint_axis_map_from_columns(df.columns, prefer_2d=True)
+    if name in cols_map and all(a in cols_map[name] for a in ('x', 'y')):
+        m = cols_map[name]
+        try:
+            arr = df[[m['x'], m['y']]].astype(float).to_numpy()
+            return arr
+        except Exception:
+            pass
+    return None
+
+
+def get_xyc_row(row: _pd.Series, name: str, prefer_2d: bool = True):
+    """한 행(row)에서 관절의 2D 좌표(x,y,c) 추출"""
+    cols_map = parse_joint_axis_map_from_columns(row.index, prefer_2d=prefer_2d)
+    x = y = c = _np.nan
+    
+    if name in cols_map:
+        m = cols_map[name]
+        try:
+            x = float(row.get(m.get('x', ''), _np.nan))
+        except Exception:
+            pass
+        try:
+            y = float(row.get(m.get('y', ''), _np.nan))
+        except Exception:
+            pass
+    
+    # 신뢰도 추출 (다양한 컬럼명 지원)
+    for c_name in [f"{name}__c", f"{name}_c", f"{name}_conf", f"{name}_score"]:
+        if c_name in row.index:
+            try:
+                c_val = float(row.get(c_name, _np.nan))
+                if not _np.isnan(c_val) and _np.isfinite(c_val):
+                    c = c_val
+                    break
+            except Exception:
+                pass
+    
+    if _np.isnan(c):
+        c = 1.0  # 기본값
+    
+    return x, y, c
+
+
+def scale_xy_for_overlay(x, y, img_w: int, img_h: int, data_range=None, margin: float = 0.1):
+    """입력 좌표를 화면 좌표로 변환 (정규화 또는 픽셀)
+    
+    Args:
+        x, y: 입력 좌표 (픽셀 또는 정규화)
+        img_w, img_h: 화면 크기 (픽셀)
+        data_range: (x_min, x_max, y_min, y_max) - 정규화 좌표 범위
+        margin: 화면 여백 비율 (기본 0.1 = 10%)
+    
+    Returns:
+        (screen_x, screen_y) 또는 (NaN, NaN)
+    """
+    try:
+        if _np.isnan(x) or _np.isnan(y):
+            return _np.nan, _np.nan
+        xf = float(x)
+        yf = float(y)
+    except Exception:
+        return _np.nan, _np.nan
+    
+    # 작은 범위(정규화) 좌표면 화면으로 매핑
+    if data_range is not None:
+        x_min, x_max, y_min, y_max = data_range
+        dx = (x_max - x_min) if (x_max - x_min) != 0 else 1.0
+        dy = (y_max - y_min) if (y_max - y_min) != 0 else 1.0
+        x_norm = (xf - x_min) / dx
+        y_norm = (yf - y_min) / dy
+        screen_x = (margin + x_norm * (1 - 2*margin)) * img_w
+        screen_y = (margin + y_norm * (1 - 2*margin)) * img_h
+        return screen_x, screen_y
+    
+    # 그렇지 않으면 픽셀 좌표로 간주
+    return xf, yf
+
+
+def compute_overlay_range(df: _pd.DataFrame, kp_names: list, prefer_2d: bool = True):
+    """DataFrame의 관절 좌표 범위 계산 → (x_min, x_max, y_min, y_max, is_small_range)"""
+    cols_map = parse_joint_axis_map_from_columns(df.columns, prefer_2d=prefer_2d)
+    xs, ys = [], []
+    
+    for name in kp_names:
+        ax = cols_map.get(name, {})
+        cx = ax.get('x')
+        cy = ax.get('y')
+        
+        if cx in df.columns:
+            try:
+                vals = _pd.to_numeric(df[cx], errors='coerce').dropna()
+                xs.extend(vals.tolist())
+            except Exception:
+                pass
+        
+        if cy in df.columns:
+            try:
+                vals = _pd.to_numeric(df[cy], errors='coerce').dropna()
+                ys.extend(vals.tolist())
+            except Exception:
+                pass
+    
+    if xs and ys:
+        x_min, x_max = min(xs), max(xs)
+        y_min, y_max = min(ys), max(ys)
+        # 값이 작으면 정규화된 좌표로 판단
+        is_small = all(abs(v) <= 2.0 for v in (x_min, x_max, y_min, y_max))
+        return x_min, x_max, y_min, y_max, is_small
+    
+    return None, None, None, None, False
+
+
+# ---------------------------------------------------------------------------
 # Example template for run_from_context (copy into metric modules):
 #
 # from metric_algorithm.runner_utils import (
-#     normalize_result, write_df_csv, relocate_overlay, upload_overlay_to_s3, ensure_dir
+#     normalize_result, write_df_csv, relocate_overlay, upload_overlay_to_s3, ensure_dir,
+#     parse_joint_axis_map_from_columns, is_dataframe_3d, get_xyz_cols, get_xy_cols_2d
 # )
 #
 # def run_from_context(ctx: dict):
@@ -487,23 +685,28 @@ def transcode_mp4_to_h264(path: str, crf: int = 23, preset: str = 'fast', timeou
 #     ensure_dir(dest)
 #     out = {}
 #     try:
-#         if wide3 is not None:
-#             # perform metric computation using existing module functions
-#             # e.g., df_metrics = compute_metric_df(wide3)
-#             metrics_csv = write_df_csv(df_metrics, dest, job_id, metric)
-#             out['metrics_csv'] = metrics_csv
-#             out['summary'] = normalize_result({'mean': df_metrics['value'].mean()})
+#         df = wide3 if wide3 is not None else wide2
+#         if df is None:
+#             return {'error': 'No DataFrame provided', 'metrics_csv': None}
+#         
+#         dim = '3d' if is_dataframe_3d(df) else '2d'
+#         
+#         # perform metric computation using standard functions
+#         # e.g., df_metrics = compute_metric_df(df)
+#         metrics_csv = write_df_csv(df_metrics, dest, job_id, metric)
+#         out['metrics_csv'] = metrics_csv
+#         out['dimension'] = dim
+#         out['summary'] = normalize_result({'mean': df_metrics['value'].mean()})
 #     except Exception as e:
-#         return {'error': str(e)}
+#         return {'error': str(e), 'metrics_csv': None}
 #
 #     # overlay (if available)
 #     try:
 #         if wide2 is not None:
-#             # generate overlay mp4 at temp location or directly to dest
+#             # generate overlay mp4
 #             overlay_local = str(dest / f"{job_id}_{metric}_overlay.mp4")
-#             # call overlay drawing function which writes overlay_local
+#             # call overlay drawing function
 #             out['overlay_mp4'] = overlay_local
-#             # optionally upload to S3
 #             s3info = upload_overlay_to_s3(overlay_local, job_id, metric)
 #             if s3info:
 #                 out['overlay_s3'] = s3info

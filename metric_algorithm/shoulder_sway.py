@@ -36,33 +36,19 @@ except ImportError:
 import sys
 sys.path.append(str(Path(__file__).parent))
 from utils_io import natural_key, ensure_dir
+from runner_utils import (
+    parse_joint_axis_map_from_columns,
+    get_xy_cols_2d,
+    get_xyc_row,
+    write_df_csv,
+    images_to_mp4,
+    upload_overlay_to_s3,
+    normalize_result,
+)
 
 
 # ===== 공통: 유연한 컬럼 매핑 =====
-def parse_joint_axis_map_from_columns(columns, prefer_2d: bool = True) -> Dict[str, Dict[str, str]]:
-    cols = list(columns)
-    mapping: Dict[str, Dict[str, str]] = {}
-    if prefer_2d:
-        axis_patterns = [('_x','_y','_z'), ('__x','__y','__z'), ('_X','_Y','_Z'), ('_X3D','_Y3D','_Z3D')]
-    else:
-        axis_patterns = [('_X3D','_Y3D','_Z3D'), ('__x','__y','__z'), ('_X','_Y','_Z'), ('_x','_y','_z')]
-    col_set = set(cols)
-    for col in cols:
-        if col.lower() in ('frame','time','timestamp'):
-            continue
-        for xp, yp, zp in axis_patterns:
-            if col.endswith(xp):
-                joint = col[:-len(xp)]
-                x_col = joint + xp
-                y_col = joint + yp
-                z_col = joint + zp
-                if x_col in col_set and y_col in col_set:
-                    mapping.setdefault(joint, {})['x'] = x_col
-                    mapping.setdefault(joint, {})['y'] = y_col
-                    if z_col in col_set:
-                        mapping[joint]['z'] = z_col
-                    break
-    return mapping
+# 참고: parse_joint_axis_map_from_columns는 runner_utils.py에서 임포트
 
 def get_xy(row: pd.Series, joint: str, cols_map: Dict[str, Dict[str, str]]):
     ax = cols_map.get(joint, {})

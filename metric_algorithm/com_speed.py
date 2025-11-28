@@ -61,33 +61,27 @@ except ImportError:
 import sys
 sys.path.append(str(Path(__file__).parent))
 from utils_io import natural_key, ensure_dir
+from runner_utils import (
+    parse_joint_axis_map_from_columns,
+    is_dataframe_3d,
+    get_xyz_cols,
+    get_xy_cols_2d,
+    get_xyc_row,
+    scale_xy_for_overlay,
+    compute_overlay_range,
+    write_df_csv,
+    images_to_mp4,
+    upload_overlay_to_s3,
+    normalize_result,
+)
 
 # =========================================================
 # 유틸리티 함수들 (__x, __y, __z 형식 전용)
 # =========================================================
-def get_xyz_cols(df: pd.DataFrame, name: str):
-    """관절의 3D 좌표 컬럼 추출 (__x, __y, __z 형식)"""
-    # 더 유연한 컬럼명 매칭: '__x', '_X3D', '_X' 등 다양한 형식을 지원
-    cols_map = parse_joint_axis_map_from_columns(df.columns)
-    if name in cols_map and all(axis in cols_map[name] for axis in ('x', 'y', 'z')):
-        x_col = cols_map[name]['x']
-        y_col = cols_map[name]['y']
-        z_col = cols_map[name]['z']
-        return df[[x_col, y_col, z_col]].to_numpy(float)
-    return None
-
-def is_dataframe_3d(df: pd.DataFrame) -> bool:
-    """데이터프레임이 3D(z 포함) 좌표를 갖는지 판단"""
-    cols_map = parse_joint_axis_map_from_columns(df.columns, prefer_2d=False)
-    for _, axes in cols_map.items():
-        if 'x' in axes and 'y' in axes and 'z' in axes:
-            return True
-    # z 접미사가 하나라도 있으면 3D로 간주
-    for c in df.columns:
-        s = str(c)
-        if s.endswith('_z') or s.endswith('__z') or s.endswith('_Z3D'):
-            return True
-    return False
+# 참고: 다음 함수들은 runner_utils.py에서 임포트합니다
+# - get_xyz_cols(): 관절의 3D 좌표 컬럼 추출
+# - is_dataframe_3d(): 데이터프레임이 3D인지 판단
+# - parse_joint_axis_map_from_columns(): 컬럼명 매핑
 
 
 # =========================================================
@@ -307,98 +301,6 @@ def grade_down_shift(pct: float) -> str:
         return '과다'
     return '보통'
 
-
-def parse_joint_axis_map_from_columns(columns, prefer_2d: bool = False) -> Dict[str, Dict[str, str]]:
-    """주어진 컬럼 리스트에서 관절명과 axis 컬럼명을 매핑합니다.
-
-    반환값 예시: {'Nose': {'x':'Nose__x','y':'Nose__y','z':'Nose__z'}, ...}
-
-    지원하는 패턴:
-      - Joint__x, Joint__y, Joint__z
-      - Joint_X3D, Joint_Y3D, Joint_Z3D
-      - Joint_X, Joint_Y, Joint_Z
-      - Joint_X_3D 등 일부 변형
-    """
-    cols = list(columns)
-    mapping: Dict[str, Dict[str, str]] = {}
-
-    # 후보 패턴을 나열 (우선순위가 높은 것부터)
-    if prefer_2d:
-        # 2D 좌표 우선 (소문자 _x/_y), 그 다음 일반/3D 변형
-        axis_patterns = [
-            ('_x', '_y', '_z'),
-            ('__x', '__y', '__z'),
-            ('_X', '_Y', '_Z'),
-            ('_X3D', '_Y3D', '_Z3D'),
-        ]
-    else:
-        # 3D 좌표 우선 (X3D), 그 다음 일반/2D
-        axis_patterns = [
-            ('_X3D', '_Y3D', '_Z3D'),
-            ('__x', '__y', '__z'),
-            ('_X', '_Y', '_Z'),
-            ('_x', '_y', '_z'),
-        ]
-
-    # 빠른 탐색을 위해 컬럼 세트를 준비
-    col_set = set(cols)
-
-    # 시도: 각 컬럼을 기준으로 관절명을 추정
-    for col in cols:
-        # skip columns that clearly aren't joints (e.g., frame, time)
-        if col.lower() in ('frame', 'time', 'timestamp'):
-            continue
-        for x_pat, y_pat, z_pat in axis_patterns:
-            if col.endswith(x_pat):
-                joint = col[:-len(x_pat)]
-                x_col = joint + x_pat
-                y_col = joint + y_pat
-                z_col = joint + z_pat
-                if x_col in col_set and y_col in col_set:
-                    # z may be missing for 2D datasets
-                    mapping.setdefault(joint, {})['x'] = x_col
-                    mapping.setdefault(joint, {})['y'] = y_col
-                    if z_col in col_set:
-                        mapping[joint]['z'] = z_col
-                    break
-
-    # 추가 패턴: CamelCase X/Y/Z 접미사 like Nose_X3D
-    # (already handled by '_X3D' pattern)
-
-    return mapping
-
-def get_xyc_row(row: pd.Series, name: str):
-    """관절의 2D 좌표 추출 (시각화용, c는 사용 안함)"""
-    # row.index에 있는 컬럼 이름들에서 해당 관절의 x/y 컬럼명을 유연하게 찾아 읽습니다.
-    cols_map = parse_joint_axis_map_from_columns(row.index, prefer_2d=True)
-    x = np.nan; y = np.nan
-    if name in cols_map:
-        if 'x' in cols_map[name]:
-            x = row.get(cols_map[name]['x'], np.nan)
-        if 'y' in cols_map[name]:
-            y = row.get(cols_map[name]['y'], np.nan)
-    else:
-        # 가상 관절 생성 (CSV에 Neck/MidHip가 없는 경우 L/R 평균으로 생성)
-        if name == 'Neck' and 'LShoulder' in cols_map and 'RShoulder' in cols_map:
-            lx = row.get(cols_map['LShoulder'].get('x', ''), np.nan)
-            ly = row.get(cols_map['LShoulder'].get('y', ''), np.nan)
-            rx = row.get(cols_map['RShoulder'].get('x', ''), np.nan)
-            ry = row.get(cols_map['RShoulder'].get('y', ''), np.nan)
-            if not (np.isnan(lx) or np.isnan(ly) or np.isnan(rx) or np.isnan(ry)):
-                x = (float(lx) + float(rx)) / 2.0
-                y = (float(ly) + float(ry)) / 2.0
-        elif name == 'MidHip' and 'LHip' in cols_map and 'RHip' in cols_map:
-            lx = row.get(cols_map['LHip'].get('x', ''), np.nan)
-            ly = row.get(cols_map['LHip'].get('y', ''), np.nan)
-            rx = row.get(cols_map['RHip'].get('x', ''), np.nan)
-            ry = row.get(cols_map['RHip'].get('y', ''), np.nan)
-            if not (np.isnan(lx) or np.isnan(ly) or np.isnan(rx) or np.isnan(ry)):
-                x = (float(lx) + float(rx)) / 2.0
-                y = (float(ly) + float(ry)) / 2.0
-    c = 1.0  # 신뢰도 컬럼이 없으므로 기본값 1.0
-    
-    return x, y, c
-
 def speed_3d(points_xyz: np.ndarray, fps):
     """
     3D 공간에서의 속도 계산
@@ -439,17 +341,10 @@ def run_from_context(ctx: dict):
     overlay mp4 from images in `ctx['img_dir']` (or `dest_dir/img`). Returns a
     JSON-serializable dict possibly containing `metrics_csv`, `overlay_mp4`, and
     `overlay_s3` (if upload succeeded).
+    
+    참고: write_df_csv, images_to_mp4, upload_overlay_to_s3, normalize_result는
+    runner_utils에서 모듈 최상단에서 임포트됨
     """
-    try:
-        from .runner_utils import write_df_csv, images_to_mp4, upload_overlay_to_s3, normalize_result
-    except Exception:
-        # best-effort fallback to absolute import
-        try:
-            from metric_algorithm.runner_utils import write_df_csv, images_to_mp4, upload_overlay_to_s3, normalize_result
-        except Exception:
-            def normalize_result(x):
-                return x
-
     out = {}
     try:
         dest = Path(ctx.get('dest_dir') or ctx.get('dest') or '.')

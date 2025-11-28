@@ -30,70 +30,27 @@ import sys
 from pathlib import Path
 sys.path.append(str(Path(__file__).parent))
 from utils_io import natural_key, ensure_dir
+from runner_utils import (
+    parse_joint_axis_map_from_columns,
+    is_dataframe_3d,
+    get_xyz_cols,
+    get_xy_cols_2d,
+    get_xyc_row,
+    scale_xy_for_overlay,
+    compute_overlay_range,
+    write_df_csv,
+    images_to_mp4,
+    upload_overlay_to_s3,
+    normalize_result,
+)
 
 # =========================================================
 # 공통 유틸/매핑 함수 (유연한 헤더 지원)
+# 참고: 다음 함수들은 runner_utils.py에서 임포트합니다
+# - parse_joint_axis_map_from_columns(): 컬럼명 매핑
+# - get_xyz_cols(): 3D 좌표 추출
+# - get_xyc_row(): 행에서 좌표 추출
 # =========================================================
-def parse_joint_axis_map_from_columns(columns, prefer_2d: bool = False):
-    cols = list(columns)
-    mapping = {}
-    if prefer_2d:
-        axis_patterns = [('_x','_y','_z'), ('__x','__y','__z'), ('_X','_Y','_Z'), ('_X3D','_Y3D','_Z3D')]
-    else:
-        axis_patterns = [('_X3D','_Y3D','_Z3D'), ('__x','__y','__z'), ('_X','_Y','_Z'), ('_x','_y','_z')]
-    col_set = set(cols)
-    for col in cols:
-        if col.lower() in ('frame','time','timestamp'):
-            continue
-        for x_pat, y_pat, z_pat in axis_patterns:
-            if col.endswith(x_pat):
-                joint = col[:-len(x_pat)]
-                x_col = joint + x_pat
-                y_col = joint + y_pat
-                z_col = joint + z_pat
-                if x_col in col_set and y_col in col_set:
-                    mapping.setdefault(joint,{})['x'] = x_col
-                    mapping.setdefault(joint,{})['y'] = y_col
-                    if z_col in col_set:
-                        mapping[joint]['z'] = z_col
-                    break
-    return mapping
-
-def get_xyz_cols(df: pd.DataFrame, name: str):
-    cols_map = parse_joint_axis_map_from_columns(df.columns, prefer_2d=False)
-    if name in cols_map and all(a in cols_map[name] for a in ('x','y','z')):
-        m = cols_map[name]
-        return df[[m['x'], m['y'], m['z']]].astype(float).to_numpy()
-    return np.full((len(df), 3), np.nan, dtype=float)
-
-def get_xyc_row(row: pd.Series, name: str):
-    cols_map = parse_joint_axis_map_from_columns(row.index, prefer_2d=True)
-    x_raw = row.get(cols_map.get(name, {}).get('x', ''), np.nan)
-    y_raw = row.get(cols_map.get(name, {}).get('y', ''), np.nan)
-    # optional confidence columns
-    c_raw = None
-    for c_name in (f"{name}__c", f"{name}_c", f"{name}_C", f"{name}_conf"):
-        if c_name in row.index:
-            c_raw = row.get(c_name)
-            break
-
-    def to_float(v):
-        try:
-            return float(v)
-        except Exception:
-            return float('nan')
-
-    x = to_float(x_raw)
-    y = to_float(y_raw)
-    c = to_float(c_raw) if c_raw is not None else float('nan')
-
-    # Treat sentinel (0,0) with missing or zero confidence as absent
-    if (not np.isnan(x) and not np.isnan(y)) and x == 0.0 and y == 0.0 and (np.isnan(c) or c == 0.0):
-        return float('nan'), float('nan'), 0.0
-
-    if np.isnan(c):
-        c = 1.0
-    return x, y, c
 
 # =========================================================
 # 2D 스무딩 유틸들 (점프 제한 없는 필터들)
@@ -360,16 +317,10 @@ def run_from_context(ctx: dict):
     Minimal implementation: if `wide2`/`wide3` exist, write CSVs and attempt to
     build an overlay mp4 from `ctx['img_dir']` or `dest_dir/img` and return
     `overlay_mp4`. Upload to S3 if configured.
+    
+    참고: write_df_csv, images_to_mp4, upload_overlay_to_s3, normalize_result는
+    runner_utils에서 모듈 최상단에서 임포트됨
     """
-    try:
-        from .runner_utils import write_df_csv, images_to_mp4, upload_overlay_to_s3, normalize_result
-    except Exception:
-        try:
-            from metric_algorithm.runner_utils import write_df_csv, images_to_mp4, upload_overlay_to_s3, normalize_result
-        except Exception:
-            def normalize_result(x):
-                return x
-
     out = {}
     try:
         dest = Path(ctx.get('dest_dir') or ctx.get('dest') or '.')
