@@ -1,2 +1,5 @@
 pose_iter_440000.caffemodel
 .env
+__pycache__/
+metric_algorithm/__pycache__/
+yolov8n.pt

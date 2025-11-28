@@ -56,12 +56,24 @@ def interpolate_sequence(frames_keypoints: List[List[List[float]]], conf_thresh:
 
     df_interp = df.interpolate(method=method, axis=0, limit=limit, limit_direction='both')
 
-    # fill remaining NaN according to fill_method
+    # CRITICAL: Match local preprocessing - aggressively fill remaining NaN
+    # Strategy: linear interpolate → forward fill → backward fill → zero fill (safety)
+    # This eliminates all NaN/zeros from missing detections, matching training data
     if fill_method != 'none':
         if fill_method == 'zero':
+            # Local uses multi-pass fill: ffill → bfill → zero
+            # Use pandas 2.x compatible syntax
+            df_interp = df_interp.ffill(limit=None)
+            df_interp = df_interp.bfill(limit=None)
             df_interp = df_interp.fillna(0.0)
         else:
-            df_interp = df_interp.fillna(method=fill_method, limit=None)
+            # For other fill methods, use new pandas syntax
+            if fill_method == 'ffill':
+                df_interp = df_interp.ffill(limit=None)
+            elif fill_method == 'bfill':
+                df_interp = df_interp.bfill(limit=None)
+            else:
+                df_interp = df_interp.fillna(0.0)
 
     # reconstruct frames
     out = []

@@ -43,6 +43,117 @@ from openpose.skeleton_interpolate import interpolate_sequence
 from openpose.openpose import run_openpose_on_video, run_openpose_on_dir, _sanitize_person_list
 
 
+# ============================================================================
+# YOLO Person Detection for Cropping
+# ============================================================================
+
+def _load_yolo_detector():
+    """Load YOLO model for person detection (matches local video_crop.py approach).
+    
+    Returns a detect function that takes a BGR numpy array and returns
+    list of (xyxy, conf, cls) tuples for detected objects.
+    """
+    try:
+        # Import torch first to ensure CUDA is properly initialized
+        import torch
+        # Force CUDA initialization to detect devices properly
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.set_device(0)
+                _ = torch.zeros(1).cuda()  # Force initialization
+                torch.cuda.synchronize()
+            except Exception as e:
+                print(f"[WARN] YOLO: Could not initialize CUDA device: {e}")
+            torch.cuda.empty_cache()
+        
+        from ultralytics import YOLO
+        # Use pre-copied model file to avoid runtime download
+        model_path = Path('/opt/skeleton_metric-api/yolov8n.pt')
+        if not model_path.exists():
+            print(f"[WARN] YOLO model not found at {model_path}, trying default download")
+            model = YOLO('yolov8n.pt')
+        else:
+            model = YOLO(str(model_path))
+        
+        # Force CPU mode to avoid CUDA conflicts with OpenPose
+        # YOLO detection is fast enough on CPU for cropping purposes
+        model.to('cpu')
+        
+        def detect(img, device='cpu'):
+            # Always use CPU for YOLO to avoid CUDA conflicts
+            results = model.predict(img, imgsz=640, device='cpu', verbose=False)
+            out = []
+            for r in results:
+                boxes = r.boxes
+                if boxes is None:
+                    continue
+                for b in boxes:
+                    xyxy = b.xyxy[0].cpu().numpy().tolist()
+                    conf = float(b.conf[0].cpu().numpy())
+                    cls = int(b.cls[0].cpu().numpy())
+                    out.append((xyxy, conf, cls))
+            return out
+        
+        # Clear CUDA cache after YOLO initialization
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
+        return detect
+    except Exception as e:
+        print(f"[WARN] Failed to load YOLO: {e}")
+        print(traceback.format_exc())
+        return None
+
+
+def _detect_person_bbox_from_video(video_path: Path, detect_fn, sample_fraction: float = 0.25):
+    """Detect person bbox from video using YOLO on sampled frames.
+    
+    Returns union bbox (x1, y1, x2, y2) in frame coordinates, or None if no person detected.
+    Matches local video_crop.py sampling and clustering logic.
+    """
+    import cv2
+    cap = cv2.VideoCapture(str(video_path))
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    
+    # Sample frames uniformly
+    target = max(1, int(frame_count * sample_fraction))
+    import numpy as np
+    indices = np.linspace(0, frame_count - 1, num=min(target, frame_count), dtype=int)
+    indices = np.unique(indices).tolist()
+    
+    all_boxes = []
+    for idx in indices:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        ok, frame = cap.read()
+        if not ok:
+            continue
+        dets = detect_fn(frame)
+        # Filter for person class (class 0 in COCO)
+        for (xyxy, conf, cls) in dets:
+            if cls == 0:  # person
+                all_boxes.append(xyxy)
+    cap.release()
+    
+    if not all_boxes:
+        return None
+    
+    # Compute union bbox
+    arr = np.array(all_boxes)
+    x1 = float(arr[:, 0].min())
+    y1 = float(arr[:, 1].min())
+    x2 = float(arr[:, 2].max())
+    y2 = float(arr[:, 3].max())
+    
+    return (x1, y1, x2, y2)
+
+
+# ============================================================================
+# OpenPose + Metrics Orchestration
+# ============================================================================
+
+
 def _safe_write_json(path: Path, obj: dict):
     """Atomically write JSON to `path` by writing to a temp file and replacing.
 
@@ -222,40 +333,327 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
         result_by_frame = []
 
         if dimension == '2d':  # --- 2D 처리 경로 ---
-            # download mp4 and run openpose on video
+            # download mp4
             local_video = tmp_dir / 'input.mp4'
             s3.download_file(bucket, key, str(local_video))
-            run_openpose_on_video(str(local_video), str(output_json_dir), str(output_img_dir))
 
-            # OpenPose 결과(JSON)를 파싱하여 프레임/사람/관절 단위의 tidy(long) DataFrame(df_2d)을 생성합니다.
+            import cv2
+            cap = cv2.VideoCapture(str(local_video))
+            frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            cap.release()
+            print(f"[INFO] Video dimensions: {frame_width}x{frame_height}")
+
+            crop_strategy = os.environ.get('OPENPOSE_CROP_STRATEGY', 'yolo').lower().strip()
+            if crop_strategy not in ('none', 'yolo', 'two_pass_keypoints'):
+                print(f"[WARN] Unknown OPENPOSE_CROP_STRATEGY={crop_strategy}, falling back to 'yolo'")
+                crop_strategy = 'yolo'
+            debug_crop_info = {'strategy': crop_strategy}
+
+            pad_x = float(os.environ.get('CROP_PAD_X', '0.15'))
+            pad_y = float(os.environ.get('CROP_PAD_Y', '0.15'))
+
+            # Helper: extract all frames to a directory
+            def _extract_frames(src_video: Path, out_dir: Path):
+                out_dir.mkdir(parents=True, exist_ok=True)
+                c = cv2.VideoCapture(str(src_video))
+                i = 0
+                ok, fr = c.read()
+                while ok:
+                    cv2.imwrite(str(out_dir / f"frame_{i:06d}.png"), fr)
+                    i += 1
+                    ok, fr = c.read()
+                c.release()
+                return i
+
+            # Strategy implementations
+            if crop_strategy == 'none':
+                print("[INFO] Using 'none' crop strategy: full-frame OpenPose")
+                crop_bbox = (0, 0, frame_width, frame_height)
+                frames_dir = tmp_dir / 'frames_full'
+                count = _extract_frames(local_video, frames_dir)
+                print(f"[INFO] Extracted {count} frames (full) for first/only pass")
+                run_openpose_on_dir(str(frames_dir), str(output_json_dir), str(output_img_dir / 'out'))
+                debug_crop_info['pass1_frame_count'] = count
+                debug_crop_info['int_bbox'] = list(crop_bbox)
+                debug_crop_info['float_bbox'] = [0.0, 0.0, float(frame_width), float(frame_height)]
+
+            elif crop_strategy == 'yolo':
+                print("[INFO] Using 'yolo' crop strategy")
+                yolo_detect = _load_yolo_detector()
+                person_bbox = None
+                if yolo_detect is not None:
+                    try:
+                        person_bbox = _detect_person_bbox_from_video(local_video, yolo_detect, sample_fraction=0.25)
+                        if person_bbox:
+                            print(f"[INFO] YOLO detected person bbox: {person_bbox}")
+                    except Exception as e:
+                        print(f"[WARN] YOLO detection failed: {e}")
+
+                if person_bbox is not None:
+                    x1f, y1f, x2f, y2f = person_bbox
+                    w, h = x2f - x1f, y2f - y1f
+                    # keep float for debug; use int for actual crop indices
+                    fx1 = max(0.0, x1f - w * pad_x)
+                    fy1 = max(0.0, y1f - h * pad_y)
+                    fx2 = min(float(frame_width), x2f + w * pad_x)
+                    fy2 = min(float(frame_height), y2f + h * pad_y)
+                    ix1, iy1, ix2, iy2 = int(fx1), int(fy1), int(fx2), int(fy2)
+                    crop_w, crop_h = ix2 - ix1, iy2 - iy1
+                    crop_bbox = (ix1, iy1, crop_w, crop_h)
+                    print(f"[INFO] Crop bbox with padding (int): {crop_bbox}")
+                    frames_crop_dir = tmp_dir / 'frames_crop'
+                    # Robust directory creation (avoid race / partial failure)
+                    try:
+                        frames_crop_dir.mkdir(parents=True, exist_ok=True)
+                    except Exception as e:
+                        print(f"[ERROR] Could not create frames_crop dir: {e}")
+                        frames_crop_dir = tmp_dir / 'frames_crop_alt'
+                        frames_crop_dir.mkdir(parents=True, exist_ok=True)
+                    cap = cv2.VideoCapture(str(local_video))
+                    idx = 0
+                    success, frame = cap.read()
+                    while success:
+                        if frame is None:
+                            success, frame = cap.read()
+                            continue
+                        crop = frame[iy1:iy2, ix1:ix2]
+                        try:
+                            cv2.imwrite(str(frames_crop_dir / f"frame_{idx:06d}.png"), crop)
+                        except Exception as e:
+                            # If write fails, attempt a fallback raw write directory
+                            fallback_dir = tmp_dir / 'frames_crop_fallback'
+                            fallback_dir.mkdir(parents=True, exist_ok=True)
+                            cv2.imwrite(str(fallback_dir / f"frame_{idx:06d}.png"), crop)
+                            frames_crop_dir = fallback_dir
+                        idx += 1
+                        success, frame = cap.read()
+                    cap.release()
+                    # Guard: if no frames written, fallback to full-frame
+                    if idx == 0 or not frames_crop_dir.exists() or len(list(frames_crop_dir.glob('*.png'))) == 0:
+                        print("[WARN] YOLO crop produced no frames -> fallback full-frame OpenPose")
+                        crop_bbox = (0, 0, frame_width, frame_height)
+                        frames_dir = tmp_dir / 'frames_full'
+                        count = _extract_frames(local_video, frames_dir)
+                        run_openpose_on_dir(str(frames_dir), str(output_json_dir), str(output_img_dir / 'out'))
+                        debug_crop_info.update({'fallback_full_frame': True, 'int_bbox': list(crop_bbox), 'float_bbox': [0.0, 0.0, float(frame_width), float(frame_height)], 'pass1_frame_count': count})
+                    else:
+                        print(f"[INFO] Cropped {idx} frames to {crop_w}x{crop_h}")
+                        # Final existence check before OpenPose run
+                        if not frames_crop_dir.exists():
+                            raise RuntimeError(f"frames_crop_dir unexpectedly missing before OpenPose: {frames_crop_dir}")
+                        run_openpose_on_dir(str(frames_crop_dir), str(output_json_dir), str(output_img_dir / 'out'))
+                        debug_crop_info.update({
+                            'yolo_bbox': list(map(float, person_bbox)),
+                            'float_bbox': [fx1, fy1, fx2 - fx1, fy2 - fy1],
+                            'int_bbox': list(crop_bbox),
+                            'cropped_frame_count': idx,
+                            'crop_dir': str(frames_crop_dir)
+                        })
+                else:
+                    print("[WARN] YOLO failed → fallback full-frame")
+                    crop_bbox = (0, 0, frame_width, frame_height)
+                    frames_dir = tmp_dir / 'frames_full'
+                    count = _extract_frames(local_video, frames_dir)
+                    run_openpose_on_dir(str(frames_dir), str(output_json_dir), str(output_img_dir / 'out'))
+                    debug_crop_info.update({'fallback_full_frame': True, 'int_bbox': list(crop_bbox), 'float_bbox': [0.0, 0.0, float(frame_width), float(frame_height)], 'pass1_frame_count': count})
+
+            else:  # two_pass_keypoints
+                print("[INFO] Using 'two_pass_keypoints' crop strategy")
+                # Pass 1: full-frame OpenPose
+                frames_full = tmp_dir / 'frames_full'
+                full_count = _extract_frames(local_video, frames_full)
+                run_openpose_on_dir(str(frames_full), str(output_json_dir), str(output_img_dir / 'pass1'))
+
+                # Parse first pass JSON to build union bbox from keypoints
+                json_pass1 = sorted([p for p in output_json_dir.iterdir() if p.suffix == '.json'])
+                xs, ys = [], []
+                for jp in json_pass1:
+                    try:
+                        data = json.load(open(jp, 'r', encoding='utf-8'))
+                        people = data.get('people', [])
+                        if not people:
+                            continue
+                        kps = np.array(people[0].get('pose_keypoints_2d', [])).reshape(-1, 3)
+                        if kps.size == 0:
+                            continue
+                        # use all joints regardless of confidence (robust bbox); optionally could filter by c>0.05
+                        xs.extend(kps[:, 0].tolist())
+                        ys.extend(kps[:, 1].tolist())
+                    except Exception:
+                        continue
+                if xs and ys:
+                    x1f, y1f, x2f, y2f = float(min(xs)), float(min(ys)), float(max(xs)), float(max(ys))
+                    w, h = x2f - x1f, y2f - y1f
+                    fx1 = max(0.0, x1f - w * pad_x)
+                    fy1 = max(0.0, y1f - h * pad_y)
+                    fx2 = min(float(frame_width), x2f + w * pad_x)
+                    fy2 = min(float(frame_height), y2f + h * pad_y)
+                    ix1, iy1, ix2, iy2 = int(fx1), int(fy1), int(fx2), int(fy2)
+                    crop_w, crop_h = ix2 - ix1, iy2 - iy1
+                    crop_bbox = (ix1, iy1, crop_w, crop_h)
+                    debug_crop_info['pass1_bbox_float'] = [fx1, fy1, fx2 - fx1, fy2 - fy1]
+                    debug_crop_info['pass1_bbox_int'] = list(crop_bbox)
+                else:
+                    print("[WARN] Pass1 produced no keypoints → fallback full-frame second pass")
+                    crop_bbox = (0, 0, frame_width, frame_height)
+                    debug_crop_info['pass1_bbox_float'] = [0.0, 0.0, float(frame_width), float(frame_height)]
+                    debug_crop_info['pass1_bbox_int'] = list(crop_bbox)
+
+                # Prepare second pass output dirs (clear previous JSONs to keep only second pass)
+                second_json_dir = tmp_dir / 'json_second'
+                second_json_dir.mkdir(parents=True, exist_ok=True)
+                # Crop frames for second pass
+                frames_crop_dir = tmp_dir / 'frames_crop'
+                frames_crop_dir.mkdir(parents=True, exist_ok=True)
+                cap2 = cv2.VideoCapture(str(local_video))
+                idx2 = 0
+                success2, frame2 = cap2.read()
+                ix1, iy1 = crop_bbox[0], crop_bbox[1]
+                ix2 = ix1 + crop_bbox[2]
+                iy2 = iy1 + crop_bbox[3]
+                while success2:
+                    crop_frame = frame2[iy1:iy2, ix1:ix2]
+                    cv2.imwrite(str(frames_crop_dir / f"frame_{idx2:06d}.png"), crop_frame)
+                    idx2 += 1
+                    success2, frame2 = cap2.read()
+                cap2.release()
+                if idx2 == 0:
+                    print("[ERROR] Two-pass: no frames cropped; falling back to full-frame for second pass")
+                    # fallback: use full frames directory
+                    frames_crop_dir = frames_full
+                    idx2 = full_count
+                print(f"[INFO] Two-pass: cropped {idx2} frames to {crop_bbox[2]}x{crop_bbox[3]}")
+                run_openpose_on_dir(str(frames_crop_dir), str(second_json_dir), str(output_img_dir / 'pass2'))
+
+                # Replace output_json_dir contents with second pass JSONs for downstream uniformity
+                try:
+                    for old in output_json_dir.glob('*.json'):
+                        old.unlink()
+                    for newj in second_json_dir.glob('*.json'):
+                        shutil.copy2(str(newj), str(output_json_dir / newj.name))
+                except Exception:
+                    pass
+                debug_crop_info.update({
+                    'pass2_frame_count': idx2,
+                    'int_bbox': list(crop_bbox),
+                    'float_bbox': debug_crop_info.get('pass1_bbox_float'),
+                    'cropped_frame_count': idx2
+                })
+
+            # persist crop debug info early
+            try:
+                response_crop_dbg_path = Path(dest_dir) / 'crop_debug.json'
+                response_crop_dbg_path.write_text(json.dumps(debug_crop_info, indent=2), encoding='utf-8')
+            except Exception:
+                pass
+
+            # OpenPose 결과(JSON)를 파싱하여 frames_keypoints 리스트 생성 (로컬 openpose_crop.py와 동일)
+            # CRITICAL: JSON still contains COCO-18, must remap to COCO-17
+            # CRITICAL: Coordinates are in cropped frame space (matching local training data)
+            _IDX_MAP_18_TO_17 = [0, 15, 14, 17, 16, 5, 2, 6, 3, 7, 4, 11, 8, 12, 9, 13, 10]
+            KP_17 = [
+                "Nose", "LEye", "REye", "LEar", "REar",
+                "LShoulder", "RShoulder", "LElbow", "RElbow",
+                "LWrist", "RWrist", "LHip", "RHip",
+                "LKnee", "RKnee", "LAnkle", "RAnkle"
+            ]
+            COLS_2D = [f"{n}_{a}" for n in KP_17 for a in ("x", "y", "c")]
+            
             json_paths = sorted([p for p in output_json_dir.iterdir() if p.suffix == '.json'])
-            rows = []  # rows for DataFrame
-            for frame_idx, jp in enumerate(json_paths):
+            frames_keypoints = []  # list[frame][joint] -> [x,y,c]
+            
+            # Parse JSON outputs into frames_keypoints (first person only, matching local)
+            for jp in json_paths:
                 with jp.open('r', encoding='utf-8') as f:
                     jdata = json.load(f)
-                raw_people = jdata.get('people', [])
-                ppl = []
-                for person_idx, p in enumerate(raw_people):
-                    if 'pose_keypoints_2d' in p:
-                        kps = p['pose_keypoints_2d']
-                        person = [kps[idx:idx+3] for idx in range(0, len(kps), 3)]
-                        person = _sanitize_person_list(person)
-                        ppl.append(person)
-                result_by_frame.append(ppl)
-
-                # convert to long-format rows: one row per joint per person
-                for person_idx, person in enumerate(ppl):
-                    for joint_idx, (x, y, c) in enumerate(person):
-                        rows.append({
-                            'frame': frame_idx,
-                            'person_idx': person_idx,
-                            'joint_idx': joint_idx,
-                            'x': float(x),
-                            'y': float(y),
-                            'conf': float(c)
-                        })
-
-            df_2d = pd.DataFrame(rows)
+                people = jdata.get('people', [])
+                if not people:
+                    # No person detected → empty frame
+                    frames_keypoints.append([])
+                else:
+                    # Take first person only (matching local training data)
+                    kps = people[0].get('pose_keypoints_2d', [])
+                    person_18 = np.array(kps).reshape(-1, 3)
+                    # Remap COCO-18 to COCO-17
+                    if person_18.shape[0] >= 18:
+                        person_17 = person_18[_IDX_MAP_18_TO_17, :]
+                    else:
+                        person_17 = person_18
+                    person = [[float(x), float(y), float(c)] for (x, y, c) in person_17]
+                    frames_keypoints.append(person)
+            
+            # CRITICAL: Apply interpolation (matches local preprocessing exactly)
+            # Local uses: conf_thresh=0.0, method='linear', fill_method='zero', interp_limit=None
+            interp = interpolate_sequence(
+                frames_keypoints,
+                conf_thresh=0.0,
+                method='linear',
+                fill_method='zero',
+                limit=None
+            )
+            
+            if not interp:
+                raise RuntimeError('Interpolated sequence empty')
+            
+            # CRITICAL: Transform cropped coordinates back to original frame space
+            # Local preprocessing saves coordinates in original frame space, not cropped
+            # This fixes the 2px difference between local.csv and skeleton2d.csv
+            crop_x_offset = crop_bbox[0] if crop_bbox else 0
+            crop_y_offset = crop_bbox[1] if crop_bbox else 0
+            
+            interp_transformed = []
+            for frame in interp:
+                transformed_frame = []
+                for kp in frame:
+                    # Add crop offset to x, y coordinates (keep confidence as-is)
+                    transformed_frame.append([
+                        kp[0] + crop_x_offset,
+                        kp[1] + crop_y_offset,
+                        kp[2]
+                    ])
+                interp_transformed.append(transformed_frame)
+            
+            # Build DataFrame with COCO-17 column names (matching local CSV format)
+            n_joints = len(interp_transformed[0]) if interp_transformed else 17
+            cols = COLS_2D if len(COLS_2D) == n_joints * 3 else [f'x_{j}' if k%3==0 else (f'y_{j//3}' if k%3==1 else f'c_{j//3}') for j,k in enumerate(range(n_joints*3))]
+            
+            rows = []
+            for frame in interp_transformed:
+                flat = []
+                for kp in frame:
+                    flat.extend([kp[0], kp[1], kp[2]])
+                if len(flat) < n_joints * 3:
+                    flat.extend([0.0] * (n_joints * 3 - len(flat)))
+                rows.append(flat)
+            
+            df_2d_wide = pd.DataFrame(rows, columns=cols[:n_joints*3])
+            
+            # CRITICAL: Save interpolated CSV (matching local training data format)
+            csv_dir = Path(dest_dir) / 'csv'
+            csv_dir.mkdir(parents=True, exist_ok=True)
+            csv_path = csv_dir / f'{job_id}_skeleton2d.csv'
+            df_2d_wide.to_csv(csv_path, index=False)
+            print(f"[INFO] Saved interpolated skeleton CSV: {csv_path}")
+            
+            # CRITICAL: Build tidy format df_2d for metric_algorithm compatibility
+            # metric_algorithm expects (frame, person_idx, joint_idx, x, y, conf) format
+            tidy_rows = []
+            for frame_idx, frame in enumerate(interp_transformed):
+                for joint_idx, (x, y, c) in enumerate(frame):
+                    tidy_rows.append({
+                        'frame': frame_idx,
+                        'person_idx': 0,  # Always first person (matching local)
+                        'joint_idx': joint_idx,
+                        'x': x,
+                        'y': y,
+                        'conf': c
+                    })
+            df_2d = pd.DataFrame(tidy_rows)
+            
+            # Use transformed interpolated data for result_by_frame (already interpolated, no need to re-interpolate later!)
+            result_by_frame = [[frame] for frame in interp_transformed]
+            
             # 원본 RGB 프레임을 dest_dir/img로 추출하여 메트릭 오버레이가 실제 프레임에 그려지도록 합니다.
             try:
                 dest_img_dir = Path(dest_dir) / 'img'
@@ -467,6 +865,8 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
                 run_openpose_on_dir(str(color_dir), str(output_json_dir), str(output_img_dir / 'out'))
 
                 # Pair JSON outputs with depth .npy by frame index ordering and build DataFrame
+                # CRITICAL: JSON still contains COCO-18, must remap to COCO-17
+                _IDX_MAP_18_TO_17 = [0, 15, 14, 17, 16, 5, 2, 6, 3, 7, 4, 11, 8, 12, 9, 13, 10]
                 json_paths = sorted([p for p in output_json_dir.iterdir() if p.suffix == '.json'])
                 rows = []
                 # Build a sorted list of depth files as a robust fallback mapping
@@ -546,13 +946,19 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
                     for person_idx, p in enumerate(raw_people):
                         if 'pose_keypoints_2d' in p:
                             kps = p['pose_keypoints_2d']
-                            person = [kps[idx:idx+3] for idx in range(0, len(kps), 3)]
+                            person_18 = [kps[idx:idx+3] for idx in range(0, len(kps), 3)]
+                            # Remap OP-18 to COCO-17 (matching local preprocessing)
+                            if len(person_18) >= 18:
+                                person = [person_18[op_idx] for op_idx in _IDX_MAP_18_TO_17]
+                            else:
+                                person = person_18
                             person = _sanitize_person_list(person)
                             ppl.append(person)
                     result_by_frame.append(ppl)
 
                     # compute 3D coordinates using intrinsics (found earlier in the tmp tree)
                     # NOTE: do not reassign `intr` here; it was discovered earlier and should persist
+                    # joint_idx here refers to COCO-17 index
 
                     for person_idx, person in enumerate(ppl):
                         for joint_idx, (x, y, c) in enumerate(person):
@@ -789,10 +1195,17 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
         if dimension not in ('2d', '3d'):
             raise RuntimeError(f'Unsupported dimension: {dimension}')
 
-        # pick first person per frame (or empty list) and interpolate
-        sequence = [(ppl[0] if (ppl and len(ppl) > 0) else []) for ppl in result_by_frame]
-        interpolated = interpolate_sequence(sequence, conf_thresh=0.0, method='linear', fill_method='none')
-        people_sequence = [([person] if person else []) for person in interpolated]
+        # For 2D, interpolation already applied in the 2D processing block above
+        # For 3D, apply interpolation here (3D path doesn't have inline interpolation yet)
+        if dimension == '2d':
+            # result_by_frame already contains interpolated data from 2D path - use as-is
+            sequence = [(ppl[0] if (ppl and len(ppl) > 0) else []) for ppl in result_by_frame]
+            people_sequence = [([person] if person else []) for person in sequence]
+        else:
+            # 3D path: apply interpolation
+            sequence = [(ppl[0] if (ppl and len(ppl) > 0) else []) for ppl in result_by_frame]
+            interpolated = interpolate_sequence(sequence, conf_thresh=0.0, method='linear', fill_method='zero')
+            people_sequence = [([person] if person else []) for person in interpolated]
 
         response_payload = {
             'message': 'OK',
@@ -805,6 +1218,15 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
             response_payload['dimension'] = dimension
         except Exception:
             pass
+        
+        # CRITICAL: Store crop_bbox info for stgcn_tester to use when converting CSV to PKL
+        try:
+            if dimension == '2d' and 'crop_bbox' in locals() and crop_bbox is not None:
+                response_payload['crop_bbox'] = list(crop_bbox)  # (x, y, w, h)
+                print(f"[INFO] Crop bbox stored in response: {crop_bbox}")
+        except Exception:
+            pass
+        
         result_basename = f"{dimension}_{job_id}"
 
         # Attach minimal DataFrame summary (not full CSV) for downstream verification.
@@ -898,6 +1320,9 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
         # If the metric runner produced structured output, merge it into the job result JSON
         try:
             if isinstance(metrics_res, dict):
+                # CRITICAL FIX: Extract top-level overlay_mp4 if present (from metric module result)
+                top_level_overlay_mp4 = metrics_res.get('overlay_mp4', None)
+                
                 # Get per-module payload
                 metrics_payload = metrics_res.get('metrics') if 'metrics' in metrics_res else metrics_res
 
@@ -909,18 +1334,31 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
                         continue
 
                     cleaned = {}
+                    
+                    # CRITICAL FIX: If top-level overlay_mp4 exists and module didn't specify its own,
+                    # use the top-level one (matches metric module's result structure)
+                    if top_level_overlay_mp4 and 'overlay_mp4' not in cleaned:
+                        cleaned['overlay_mp4'] = top_level_overlay_mp4
 
                     # Keep summary if available
                     if 'summary' in mval and isinstance(mval['summary'], dict):
                         cleaned['summary'] = mval['summary']
 
-                    # Collect CSV paths from values (strings or lists)
+                    # Collect CSV paths and overlay info from values (strings or lists)
                     csv_paths = []
+                    overlay_mp4 = None
+                    overlay_s3 = None
+                    
                     for k, v in mval.items():
-                        # skip overlay/mp4 etc.
-                        if k.lower().startswith('overlay'):
+                        # CRITICAL FIX: Collect overlay_mp4/overlay_s3 BEFORE skipping them
+                        if k.lower() == 'overlay_mp4' and v:
+                            overlay_mp4 = v
+                        elif k.lower() == 'overlay_s3' and v:
+                            overlay_s3 = v
+                        # skip other overlay/mp4 fields during CSV collection
+                        elif k.lower().startswith('overlay'):
                             continue
-                        if isinstance(v, str) and v.lower().endswith('.csv'):
+                        elif isinstance(v, str) and v.lower().endswith('.csv'):
                             p = Path(v)
                             if not p.exists():
                                 # try relative to dest_dir
@@ -987,11 +1425,11 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
                             # non-fatal — include raw csv paths if conversion failed
                             cleaned['frame_data_error'] = 'failed to read/convert csv'
 
-                    # Keep overlay info (s3 or local) if present
-                    if 'overlay_mp4' in mval:
-                        cleaned['overlay_mp4'] = mval.get('overlay_mp4')
-                    if 'overlay_s3' in mval:
-                        cleaned['overlay_s3'] = mval.get('overlay_s3')
+                    # CRITICAL FIX: Always include overlay_mp4 and overlay_s3 if collected
+                    if overlay_mp4:
+                        cleaned['overlay_mp4'] = overlay_mp4
+                    if overlay_s3:
+                        cleaned['overlay_s3'] = overlay_s3
 
                     # If no summary and no frame_data, preserve original (may include error info)
                     if not cleaned:
@@ -1000,6 +1438,125 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
                         cleaned_metrics[mname] = cleaned
 
                 response_payload['metrics'] = cleaned_metrics
+
+                # CRITICAL FIX: Extract top-level overlay_mp4 from first metric that has it
+                # This ensures overlay_mp4 appears at the top level of the final JSON
+                if top_level_overlay_mp4:
+                    response_payload['overlay_mp4'] = top_level_overlay_mp4
+                else:
+                    # Try to get overlay_mp4 from any metric
+                    for mname, ment in cleaned_metrics.items():
+                        if isinstance(ment, dict) and ment.get('overlay_mp4'):
+                            response_payload['overlay_mp4'] = ment['overlay_mp4']
+                            break
+
+                # Ensure every metric entry includes an `overlay_mp4` field when
+                # a matching overlay file exists under `dest_dir/mp4/` or `dest_dir/`.
+                # Try multiple matching strategies (filename contains metric name,
+                # parts of metric name, then fallback to assigning any unclaimed
+                # overlay files deterministically).
+                try:
+                    mp4_dir = Path(dest_dir) / 'mp4'
+                    # collect candidate overlay files (mp4s that mention 'overlay' or end with .mp4)
+                    candidates = []
+                    if mp4_dir.exists():
+                        candidates.extend([p for p in sorted(mp4_dir.iterdir()) if p.suffix.lower() == '.mp4'])
+                    # also consider mp4s at dest root
+                    candidates.extend([p for p in sorted(Path(dest_dir).glob('*.mp4')) if p not in candidates])
+
+                    # only keep overlay-like names first, but keep all mp4s as fallback
+                    overlay_like = [p for p in candidates if 'overlay' in p.name.lower()]
+                    other_mp4s = [p for p in candidates if p not in overlay_like]
+                    candidates = overlay_like + other_mp4s
+
+                    # track which candidate files have been claimed/assigned
+                    claimed = set()
+
+                    # helper: normalize strings for comparison
+                    def _norm(s: str) -> str:
+                        return s.replace('-', '_').lower()
+
+                    # first pass: exact metric name substring match (case-insensitive)
+                    for mname, ment in cleaned_metrics.items():
+                        try:
+                            if not isinstance(ment, dict):
+                                continue
+                            if ment.get('overlay_mp4'):
+                                continue
+                            mnorm = _norm(mname)
+                            found = None
+                            for cand in candidates:
+                                if cand in claimed:
+                                    continue
+                                if mnorm in _norm(cand.name):
+                                    found = cand
+                                    break
+                            if found:
+                                ment['overlay_mp4'] = str(Path('mp4') / found.name) if found.parent.samefile(mp4_dir) else str(Path('mp4') / found.name) if mp4_dir.exists() else str(found.name)
+                                claimed.add(found)
+                        except Exception:
+                            pass
+
+                    # second pass: match any token from metric name (split on '_')
+                    for mname, ment in cleaned_metrics.items():
+                        try:
+                            if not isinstance(ment, dict):
+                                continue
+                            if ment.get('overlay_mp4'):
+                                continue
+                            tokens = [t for t in _norm(mname).split('_') if t]
+                            found = None
+                            for cand in candidates:
+                                if cand in claimed:
+                                    continue
+                                cname = _norm(cand.name)
+                                if any(tok in cname for tok in tokens):
+                                    found = cand
+                                    break
+                            if found:
+                                ment['overlay_mp4'] = str(Path('mp4') / found.name) if found.parent.samefile(mp4_dir) else str(Path('mp4') / found.name)
+                                claimed.add(found)
+                        except Exception:
+                            pass
+
+                    # final fallback: assign any remaining unclaimed overlay-like mp4s
+                    for mname, ment in cleaned_metrics.items():
+                        try:
+                            if not isinstance(ment, dict):
+                                continue
+                            if ment.get('overlay_mp4'):
+                                continue
+                            # pick the first unclaimed candidate
+                            found = None
+                            for cand in candidates:
+                                if cand in claimed:
+                                    continue
+                                found = cand
+                                break
+                            if found:
+                                ment['overlay_mp4'] = str(Path('mp4') / found.name)
+                                claimed.add(found)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+                # Final guaranteed fallback: if any metric still lacks overlay_mp4,
+                # inject the conventional expected path `mp4/{job_id}_{metric}_overlay.mp4`.
+                try:
+                    _job = job_id if 'job_id' in locals() else (job if 'job' in locals() else None)
+                    if _job:
+                        for mname, ment in cleaned_metrics.items():
+                            try:
+                                if not isinstance(ment, dict):
+                                    continue
+                                if ment.get('overlay_mp4'):
+                                    continue
+                                ment['overlay_mp4'] = str(Path('mp4') / f"{_job}_{mname}_overlay.mp4")
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
 
                 # Note: metrics result file paths are intentionally not injected into the
                 # top-level response payload (consumer expects metrics under 'metrics').
@@ -1624,7 +2181,7 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
                 final_path = Path(dest_dir) / f"{result_basename}.json"
                 if not final_path.exists():
                     final_path = Path(dest_dir) / f"{job_id}.json"
-                allowed = ('frame_count', 'dimension', 'skeleton_rows', 'skeleton_columns', 'debug', 'metrics', 'stgcn_inference')
+                allowed = ('frame_count', 'dimension', 'skeleton_rows', 'skeleton_columns', 'debug', 'metrics', 'stgcn_inference', 'overlay_mp4')
                 filtered = {k: response_payload[k] for k in allowed if k in response_payload}
                 _safe_write_json(final_path, filtered)
                 # Ensure a canonical <job_id>.json exists for downstream upload/consumers

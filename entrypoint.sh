@@ -6,6 +6,40 @@ set -e
 # Activate any environment setup if needed (OpenPose image may already have it)
 # cd /opt/openpose-api
 
+# Ensure CUDA environment is properly set
+export CUDA_HOME=${CUDA_HOME:-/usr/local/cuda}
+export PATH=${CUDA_HOME}/bin:${PATH}
+# CRITICAL: CUDA lib64 must come FIRST to prevent OpenCV's bundled CUDA libs from taking precedence
+export LD_LIBRARY_PATH=${CUDA_HOME}/lib64:${CUDA_HOME}/extras/CUPTI/lib64:/usr/local/nvidia/lib:/usr/local/nvidia/lib64:${LD_LIBRARY_PATH}
+# Unset CUDA_VISIBLE_DEVICES to let nvidia-container-runtime handle it
+unset CUDA_VISIBLE_DEVICES
+
+# Verify CUDA availability (optional, for diagnostics)
+echo "=== CUDA Environment Check ==="
+echo "CUDA_HOME: $CUDA_HOME"
+echo "CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-not set}"
+echo "LD_LIBRARY_PATH: $LD_LIBRARY_PATH"
+nvidia-smi || echo "Warning: nvidia-smi failed (GPU may not be available)"
+python3 -c "
+import torch
+print(f'PyTorch version: {torch.__version__}')
+print(f'PyTorch CUDA available: {torch.cuda.is_available()}')
+if torch.cuda.is_available():
+    print(f'PyTorch CUDA version: {torch.version.cuda}')
+    try:
+        torch.cuda.set_device(0)
+        x = torch.zeros(1).cuda()
+        torch.cuda.synchronize()
+        print(f'Device count: {torch.cuda.device_count()}')
+        print(f'Device 0 name: {torch.cuda.get_device_name(0)}')
+        print(f'CUDA initialization: SUCCESS')
+    except Exception as e:
+        print(f'CUDA initialization: FAILED - {e}')
+else:
+    print('No CUDA devices available to PyTorch')
+" || echo "Warning: PyTorch CUDA check failed"
+echo "=============================="
+
 # Start FastAPI server with uvicorn
 export OPENPOSE_BATCH_SIZE=${OPENPOSE_BATCH_SIZE:-32}
 export OPENPOSE_NUM_GPU=${OPENPOSE_NUM_GPU:-1}

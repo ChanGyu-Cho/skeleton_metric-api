@@ -10,9 +10,10 @@ COM(무게중심) 분석의 중요성:
 적절한 COM 이동은 효율적인 에너지 전달과 안정적인 스윙을 만듭니다.
 
 주요 기능:
-1. COM 위치 계산
+1. COM 위치 계산 (신뢰도 가중치 지원)
    - 모든 감지된 관절의 3D 좌표를 기반으로 무게중심 계산
-   - 각 관절에 동일한 가중치 적용 (신뢰도 컬럼 없음)
+   - 신뢰도 컬럼(_c)이 있으면 가중 평균, 없으면 동일 가중치 적용
+   - 설정 파일(analyze.yaml)의 'com_use_confidence' 옵션으로 제어
    - 실시간 COM 위치 추적
 
 2. COM Speed 분석  
@@ -28,7 +29,19 @@ COM(무게중심) 분석의 중요성:
 
 데이터 형식: 
    - CSV 컬럼: Joint__x, Joint__y, Joint__z (더블 언더스코어)
-   - 신뢰도 컬럼(_c) 없음 - 모든 관절 동일 가중치
+   - 신뢰도 컬럼(_c) 지원 - Joint__c 또는 Joint_c 형식
+
+설정 옵션 (analyze.yaml):
+   - com_use_confidence: true/false (기본값: true) - 신뢰도 가중치 사용 여부
+   - ignore_joints: [list] - COM 계산에서 제외할 관절명
+   
+사용 예시:
+   # YAML 설정 파일
+   com_use_confidence: true  # 신뢰도 가중치 활성화
+   ignore_joints:
+     - Nose
+     - LEye
+     - REye
 """
 import argparse
 from pathlib import Path
@@ -415,6 +428,86 @@ def speed_3d(points_xyz: np.ndarray, fps):
     v = pd.Series(v).fillna(method="ffill").fillna(0).to_numpy()
     return v, unit
 
+
+def run_from_context(ctx: dict):
+    """Runner hook for controller: write metric CSVs and create overlay mp4.
+
+    Context parameters:
+    - use_confidence (bool): COM 계산 시 신뢰도 가중치 사용 여부 (기본값: True)
+    
+    Minimal implementation: write available wide3/wide2 to CSV and create an
+    overlay mp4 from images in `ctx['img_dir']` (or `dest_dir/img`). Returns a
+    JSON-serializable dict possibly containing `metrics_csv`, `overlay_mp4`, and
+    `overlay_s3` (if upload succeeded).
+    """
+    try:
+        from .runner_utils import write_df_csv, images_to_mp4, upload_overlay_to_s3, normalize_result
+    except Exception:
+        # best-effort fallback to absolute import
+        try:
+            from metric_algorithm.runner_utils import write_df_csv, images_to_mp4, upload_overlay_to_s3, normalize_result
+        except Exception:
+            def normalize_result(x):
+                return x
+
+    out = {}
+    try:
+        dest = Path(ctx.get('dest_dir') or ctx.get('dest') or '.')
+        job_id = str(ctx.get('job_id') or ctx.get('job') or 'job')
+        metric = 'com_speed'
+        
+        # COM 계산 시 신뢰도 가중치 사용 여부
+        use_confidence_weights = ctx.get('use_confidence', True)
+        if isinstance(use_confidence_weights, str):
+            use_confidence_weights = use_confidence_weights.lower() in ('true', '1', 'yes')
+        
+        # write available wide3/wide2 dataframes to csv for downstream
+        wide3 = ctx.get('wide3')
+        wide2 = ctx.get('wide2')
+        try:
+            if wide3 is not None:
+                out['metrics_csv'] = write_df_csv(wide3, dest, job_id, metric)
+                # 추가: COM 포인트 계산 및 메타데이터
+                try:
+                    is_3d = is_dataframe_3d(wide3)
+                    if is_3d:
+                        com_pts = compute_com_points_3d(wide3, use_confidence=use_confidence_weights)
+                    else:
+                        com_pts = compute_com_points_2d(wide3, use_confidence=use_confidence_weights)
+                    out['com_calculation_mode'] = 'confidence_weighted' if use_confidence_weights else 'equal_weight'
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # Attempt to create overlay mp4 from images in img_dir
+        try:
+            img_dir = Path(ctx.get('img_dir') or (Path(dest) / 'img'))
+            imgs = []
+            if img_dir.exists() and img_dir.is_dir():
+                imgs = sorted([p for p in img_dir.iterdir() if p.suffix.lower() in ('.jpg', '.jpeg', '.png')])
+            # fallback to dest/openpose_img
+            if not imgs:
+                op_dir = Path(dest) / 'openpose_img'
+                if op_dir.exists() and op_dir.is_dir():
+                    imgs = sorted([p for p in op_dir.iterdir() if p.suffix.lower() in ('.jpg', '.jpeg', '.png')])
+            if imgs:
+                out_mp4 = Path(dest) / f"{job_id}_{metric}_overlay.mp4"
+                created, used = images_to_mp4(imgs, out_mp4, fps=float(ctx.get('fps', 30)), resize=None, filter_rendered=True, write_debug=True)
+                if created:
+                    out['overlay_mp4'] = str(out_mp4)
+                    try:
+                        s3info = upload_overlay_to_s3(str(out_mp4), job_id, metric)
+                        if s3info:
+                            out['overlay_s3'] = s3info
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+    except Exception as e:
+        out['error'] = str(e)
+    return normalize_result(out)
+
 def load_cfg(p: Path):
     if p.suffix.lower() in (".yml", ".yaml"):
         if yaml is None:
@@ -642,15 +735,17 @@ def smooth_df_2d(
 # =========================================================
 # COM 전용 계산 함수 (__x, __y, __z 형식에 최적화)
 # =========================================================
-def compute_com_points_3d(df: pd.DataFrame, ignore_joints: Optional[set] = None):
+def compute_com_points_3d(df: pd.DataFrame, ignore_joints: Optional[set] = None, use_confidence: bool = True):
     """
     프레임별 3D 무게중심(COM) 계산
     
     CSV의 __x, __y, __z 컬럼을 사용하여 무게중심을 계산합니다.
-    신뢰도(_c) 컬럼이 없으므로 모든 관절에 동일한 가중치를 적용합니다.
+    신뢰도(_c) 컬럼이 있으면 가중 평균, 없으면 동일 가중치를 적용합니다.
     
     Args:
         df (pd.DataFrame): 관절 좌표 데이터프레임
+        ignore_joints (set): 무시할 관절 이름 집합
+        use_confidence (bool): True면 신뢰도 가중치 사용, False면 동일 가중치
         
     Returns:
         np.ndarray: (N, 3) 형태의 COM 좌표 시퀀스 (mm 단위)
@@ -660,69 +755,173 @@ def compute_com_points_3d(df: pd.DataFrame, ignore_joints: Optional[set] = None)
     ignore = set(ignore_joints or [])
     valid_joints = [j for j, axes in cols_map.items() if j not in ignore and all(a in axes for a in ('x', 'y', 'z'))]
     
-    print(f"🎯 COM 계산용 관절: {valid_joints} (총 {len(valid_joints)}개)")
+    # 신뢰도 컬럼 가용성 확인
+    has_confidence = any(f"{j}__c" in df.columns or f"{j}_c" in df.columns for j in valid_joints)
+    mode = "가중치(신뢰도)" if (use_confidence and has_confidence) else "동일 가중치"
+    print(f"🎯 COM 계산용 관절: {valid_joints} (총 {len(valid_joints)}개) [{mode}]")
     
     N = len(df)
     com = np.full((N, 3), np.nan, dtype=float)
     
     for i in range(N):
-        valid_coords = []
-        
-        for joint in valid_joints:
-            cols = cols_map[joint]
-            x_val = df.loc[i, cols['x']]
-            y_val = df.loc[i, cols['y']]
-            z_val = df.loc[i, cols['z']]
+        if use_confidence and has_confidence:
+            # 신뢰도 가중 평균
+            coords_list = []
+            weights_list = []
             
-            # NaN이 아닌 유효한 좌표만 사용
-            if not (np.isnan(x_val) or np.isnan(y_val) or np.isnan(z_val)):
-                valid_coords.append([x_val, y_val, z_val])
-        
-        # 유효한 좌표가 있으면 평균 계산 (동일 가중치)
-        if valid_coords:
-            com[i] = np.mean(valid_coords, axis=0)
+            for joint in valid_joints:
+                cols = cols_map[joint]
+                x_val = df.loc[i, cols['x']]
+                y_val = df.loc[i, cols['y']]
+                z_val = df.loc[i, cols['z']]
+                
+                # 신뢰도 추출 (다양한 컬럼명 지원)
+                conf_val = None
+                for conf_col in [f"{joint}__c", f"{joint}_c", f"{joint}_conf", f"{joint}_score"]:
+                    if conf_col in df.columns:
+                        try:
+                            conf_val = float(df.loc[i, conf_col])
+                            if np.isfinite(conf_val) and conf_val > 0:
+                                break
+                        except Exception:
+                            pass
+                
+                # NaN이 아닌 유효한 좌표 + 신뢰도만 사용
+                if not (np.isnan(x_val) or np.isnan(y_val) or np.isnan(z_val)):
+                    if conf_val is None or not np.isfinite(conf_val):
+                        conf_val = 1.0  # 신뢰도 없으면 기본값 1.0
+                    
+                    if conf_val > 0:  # 신뢰도가 양수만 사용
+                        coords_list.append([x_val, y_val, z_val])
+                        weights_list.append(conf_val)
+            
+            # 가중 평균 계산
+            if coords_list and weights_list:
+                coords_arr = np.array(coords_list, dtype=float)
+                weights_arr = np.array(weights_list, dtype=float)
+                weights_normalized = weights_arr / np.sum(weights_arr)  # 정규화
+                com[i] = np.sum(coords_arr * weights_normalized[:, np.newaxis], axis=0)
+        else:
+            # 동일 가중치 평균
+            valid_coords = []
+            
+            for joint in valid_joints:
+                cols = cols_map[joint]
+                x_val = df.loc[i, cols['x']]
+                y_val = df.loc[i, cols['y']]
+                z_val = df.loc[i, cols['z']]
+                
+                # NaN이 아닌 유효한 좌표만 사용
+                if not (np.isnan(x_val) or np.isnan(y_val) or np.isnan(z_val)):
+                    valid_coords.append([x_val, y_val, z_val])
+            
+            # 유효한 좌표가 있으면 평균 계산
+            if valid_coords:
+                com[i] = np.mean(valid_coords, axis=0)
     
     return com
 
 
-def compute_com_points_2d(df: pd.DataFrame, ignore_joints: Optional[set] = None):
+def compute_com_points_2d(df: pd.DataFrame, ignore_joints: Optional[set] = None, use_confidence: bool = True):
     """
     프레임별 2D 무게중심(COM) 계산
 
     설명:
-    - 오버레이용 CSV(2D 좌표)가 별도로 주어질 때, 화면에 그릴 COM 위치는
-      해당 2D 좌표들의 평균으로 계산하는 것이 가장 직관적입니다.
-    - 이 함수는 '__x'/'__y' 접미사를 가진 관절들을 찾아 NaN이 아닌 값의 평균을
-      계산하여 (N,2) 배열을 반환합니다.
+    - 오버레이용 CSV(2D 좌표)가 별도로 주어질 때, 화면에 그릴 COM 위치를 계산합니다.
+    - 신뢰도 컬럼이 있으면 가중 평균, 없으면 동일 가중치 평균을 사용합니다.
+    - '__x'/'__y' 또는 '_x'/'_y' 접미사를 가진 관절들을 찾아 평균을 계산합니다.
 
     Args:
         df (pd.DataFrame): 2D 좌표가 담긴 데이터프레임
+        ignore_joints (set): 무시할 관절 이름 집합
+        use_confidence (bool): True면 신뢰도 가중치 사용, False면 동일 가중치
 
     Returns:
         np.ndarray: (N,2) 형태의 COM 2D 좌표 시퀀스 (픽셀 또는 입력 좌표 단위)
     """
-    cols_map = parse_joint_axis_map_from_columns(df.columns)
+    cols_map = parse_joint_axis_map_from_columns(df.columns, prefer_2d=True)
     ignore = set(ignore_joints or [])
-    joint_names = [k for k in cols_map.keys() if k not in ignore]
+    joint_names = [k for k in cols_map.keys() if k not in ignore and 'x' in cols_map[k] and 'y' in cols_map[k]]
+
+    # 신뢰도 컬럼 가용성 확인
+    has_confidence = any(f"{j}__c" in df.columns or f"{j}_c" in df.columns for j in joint_names)
+    mode = "가중치(신뢰도)" if (use_confidence and has_confidence) else "동일 가중치"
+    print(f"🎯 COM 2D 계산용 관절: {joint_names} (총 {len(joint_names)}개) [{mode}]")
 
     N = len(df)
     com2d = np.full((N, 2), np.nan, dtype=float)
 
     for i in range(N):
-        xs = []
-        ys = []
         row = df.iloc[i]
-        for j in joint_names:
-            axes = cols_map.get(j, {})
-            xc = axes.get('x')
-            yc = axes.get('y')
-            if xc in row.index and yc in row.index:
-                xv = row[xc]; yv = row[yc]
-                if not (np.isnan(xv) or np.isnan(yv)):
-                    xs.append(float(xv)); ys.append(float(yv))
-        if xs and ys:
-            com2d[i, 0] = float(np.mean(xs))
-            com2d[i, 1] = float(np.mean(ys))
+        
+        if use_confidence and has_confidence:
+            # 신뢰도 가중 평균
+            x_list = []
+            y_list = []
+            weights_list = []
+            
+            for joint in joint_names:
+                axes = cols_map.get(joint, {})
+                xc = axes.get('x')
+                yc = axes.get('y')
+                
+                if xc in row.index and yc in row.index:
+                    try:
+                        xv = float(row[xc])
+                        yv = float(row[yc])
+                    except Exception:
+                        continue
+                    
+                    if not (np.isnan(xv) or np.isnan(yv)):
+                        # 신뢰도 추출 (다양한 컬럼명 지원)
+                        conf_val = None
+                        for conf_col in [f"{joint}__c", f"{joint}_c", f"{joint}_conf", f"{joint}_score"]:
+                            if conf_col in row.index:
+                                try:
+                                    conf_val = float(row[conf_col])
+                                    if np.isfinite(conf_val) and conf_val > 0:
+                                        break
+                                except Exception:
+                                    pass
+                        
+                        if conf_val is None or not np.isfinite(conf_val):
+                            conf_val = 1.0  # 신뢰도 없으면 기본값 1.0
+                        
+                        if conf_val > 0:  # 신뢰도가 양수만 사용
+                            x_list.append(xv)
+                            y_list.append(yv)
+                            weights_list.append(conf_val)
+            
+            # 가중 평균 계산
+            if x_list and y_list and weights_list:
+                weights_arr = np.array(weights_list, dtype=float)
+                weights_normalized = weights_arr / np.sum(weights_arr)
+                com2d[i, 0] = float(np.sum(np.array(x_list) * weights_normalized))
+                com2d[i, 1] = float(np.sum(np.array(y_list) * weights_normalized))
+        else:
+            # 동일 가중치 평균
+            xs = []
+            ys = []
+            
+            for joint in joint_names:
+                axes = cols_map.get(joint, {})
+                xc = axes.get('x')
+                yc = axes.get('y')
+                
+                if xc in row.index and yc in row.index:
+                    try:
+                        xv = float(row[xc])
+                        yv = float(row[yc])
+                    except Exception:
+                        continue
+                    
+                    if not (np.isnan(xv) or np.isnan(yv)):
+                        xs.append(xv)
+                        ys.append(yv)
+            
+            if xs and ys:
+                com2d[i, 0] = float(np.mean(xs))
+                com2d[i, 1] = float(np.mean(ys))
 
     return com2d
 
@@ -1159,13 +1358,19 @@ def main():
     ignore_cfg = set(cfg.get('ignore_joints', [])) if isinstance(cfg.get('ignore_joints', []), list) else set()
     ignore_set = default_ignore.union(ignore_cfg)
 
+    # COM 계산 시 신뢰도 사용 여부 (기본값: True)
+    use_confidence_weights = cfg.get('com_use_confidence', True)
+    if isinstance(use_confidence_weights, str):
+        use_confidence_weights = use_confidence_weights.lower() in ('true', '1', 'yes')
+    print(f"🎯 COM 신뢰도 가중치: {use_confidence_weights}")
+
     # 2) 차원 감지 후 COM 계산 (2D/3D 자동 분기)
     use_3d = is_dataframe_3d(df_metrics)
     if use_3d:
-        com_pts = compute_com_points_3d(df_metrics, ignore_joints=ignore_set)
+        com_pts = compute_com_points_3d(df_metrics, ignore_joints=ignore_set, use_confidence=use_confidence_weights)
         com_v, com_unit = speed_3d(com_pts, fps)
     else:
-        com2 = compute_com_points_2d(df_metrics, ignore_joints=ignore_set)
+        com2 = compute_com_points_2d(df_metrics, ignore_joints=ignore_set, use_confidence=use_confidence_weights)
         com_v, com_unit = speed_2d(com2, fps)
         # 2D에서도 이후 로직 호환을 위해 (N,3) 포맷으로 패딩
         com_pts = np.hstack([com2, np.full((len(com2), 1), np.nan)]) if len(com2) > 0 else np.full((len(df_metrics), 3), np.nan)
@@ -1547,6 +1752,7 @@ def run_from_context(ctx: dict):
                 out_obj = {
                     'job_id': job_id,
                     'dimension': '3d' if use_3d else '2d',
+                    'overlay_mp4': out.get('overlay_mp4'),
                     'metrics': {
                         'com_speed': {
                             'summary': {

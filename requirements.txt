@@ -2,6 +2,11 @@
 # Use unpinned package names by default to reduce version conflict risk.
 # Pin a specific version only when absolutely necessary.
 
+# CRITICAL: PyTorch should be installed FIRST via pip install command in Dockerfile
+# with explicit CUDA version (--index-url https://download.pytorch.org/whl/cu121)
+# to ensure compatibility with OpenPose CUDA 12.x runtime.
+# DO NOT list torch/torchvision here - they are installed separately in Dockerfile.
+
 fastapi
 uvicorn
 numpy
@@ -15,3 +20,8 @@ boto3
 
 # for stgcn-api request
 requests
+
+# YOLO for person detection and cropping (matches local preprocessing)
+# ultralytics will use the pre-installed PyTorch from Dockerfile
+ultralytics
+scikit-learn  # required for clustering in YOLO crop logic

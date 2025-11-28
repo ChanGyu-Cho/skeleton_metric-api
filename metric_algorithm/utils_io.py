@@ -57,23 +57,16 @@ def tidy_to_wide(df_tidy, dimension: str = '2d', person_idx: int = 0):
 
     frames = sorted(df_person['frame'].unique())
     rows = []
-    # detect if incoming joint_idx values appear to be OpenPose-18 indexed
-    incoming_max_idx = int(df_person['joint_idx'].max()) if len(df_person) > 0 else -1
-    use_op18_map = incoming_max_idx >= 17  # indices 0..17 suggest OpenPose-18 ordering
-    if use_op18_map:
-        # build reverse mapping: op18_index -> kp17_name
-        op18_to_kp17_name = {op_idx: COCO_KP17[kp_idx] for kp_idx, op_idx in enumerate(_IDX_MAP_18_TO_17)}
-    else:
-        op18_to_kp17_name = {}
+    # CRITICAL FIX: joint_idx is already COCO-17 after controller remapping
+    # Do NOT apply OpenPose-18 remapping here - controller.py handles it when parsing JSON
+    # Simply use joint_idx as direct COCO-17 index
     for fr in frames:
         row = {'frame': int(fr)}
         sub = df_person[df_person['frame'] == fr]
         for _, r in sub.iterrows():
             j = int(r['joint_idx'])
-            if use_op18_map and j in op18_to_kp17_name:
-                name = op18_to_kp17_name[j]
-            else:
-                name = COCO_KP17[j] if 0 <= j < len(COCO_KP17) else f'J{j}'
+            # joint_idx is COCO-17 index (0..16), map directly to COCO_KP17 names
+            name = COCO_KP17[j] if 0 <= j < len(COCO_KP17) else f'J{j}'
             if dimension == '2d':
                 xval = float(r.get('x', float('nan')))
                 yval = float(r.get('y', float('nan')))

@@ -125,12 +125,20 @@ def sanitize_skeleton_csv(csv_path: Path) -> Path:
         return csv_path
 
 
-def _mmaction_post_worker(input_path: Path, api_url: str, resp_path: Path, job_id_local: str, dimension_local: str):
+def _mmaction_post_worker(input_path: Path, api_url: str, resp_path: Path, job_id_local: str, dimension_local: str, crop_bbox: Optional[tuple] = None):
     try:
         txt = input_path.read_text(encoding='utf-8')
         b64 = base64.b64encode(txt.encode('utf-8')).decode('utf-8')
-        # send only csv_base64 payload to match the original client API
+        # send csv_base64 and optional crop_bbox to match the API payload
         payload = {'csv_base64': b64}
+        
+        # CRITICAL FIX: Include crop_bbox if provided (for keypoint offset correction)
+        if crop_bbox is not None:
+            try:
+                payload['crop_bbox'] = list(crop_bbox)
+            except Exception:
+                pass
+        
         try:
             resp = requests.post(api_url, json=payload, timeout=(5, 600))
             if resp.ok:
@@ -172,6 +180,14 @@ def start_mmaction_from_csv(csv_path: Path, dest_dir: str, job_id: str, dimensio
         mmaction_api = mmaction_api or response_payload.setdefault('debug', {}).get('mmaction_api') or os.environ.get('MMACTION_API_URL') or 'http://mmaction2:19031/mmaction_stgcn_test'
         response_payload.setdefault('debug', {})['mmaction_api'] = mmaction_api
 
+        # CRITICAL FIX: Extract crop_bbox from response_payload if present
+        crop_bbox = response_payload.get('crop_bbox', None)
+        if crop_bbox is not None:
+            try:
+                crop_bbox = tuple(crop_bbox)
+            except Exception:
+                crop_bbox = None
+
         missing = _validate_csv_matches_coco(Path(csv_path))
         if missing:
             try:
@@ -182,9 +198,9 @@ def start_mmaction_from_csv(csv_path: Path, dest_dir: str, job_id: str, dimensio
             response_payload.setdefault('debug', {})['mmaction_missing_cols'] = missing[:50]
             return {'csv_ready': False, 'csv_path': Path(csv_path), 'response_path': resp_path, 'thread_started': False}
 
-        # start worker thread to POST the CSV
+        # start worker thread to POST the CSV (with crop_bbox)
         try:
-            t = threading.Thread(target=_mmaction_post_worker, args=(Path(csv_path), mmaction_api, resp_path, job_id, dimension), daemon=True)
+            t = threading.Thread(target=_mmaction_post_worker, args=(Path(csv_path), mmaction_api, resp_path, job_id, dimension, crop_bbox), daemon=True)
             t.start()
             response_payload.setdefault('debug', {})['mmaction_thread_started'] = True
             return {'csv_ready': True, 'csv_path': Path(csv_path), 'response_path': resp_path, 'thread_started': True, 'thread': t}

@@ -1,0 +1,75 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Git
+.git/
+.gitignore
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Logs
+*.log
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Documentation (if not needed in image)
+*.md
+!README.md
+
+# Large files that shouldn't be in container
+*.pth
+*.pkl
+*.h5
+*.onnx
+!pose_iter_440000.caffemodel
+!yolov8n.pt
+
+# Debug/analysis scripts (keep debug_openpose_mapping.py)
+analyze_*.py
+verify_*.ps1
+verify_*.sh
+verify_*.py
+diagnose_*.py
+REBUILD_*.md
+QUICK_*.ps1
+CUDA_*.md
+BUILD_*.md
+clean_build.ps1
+fast_rebuild.ps1
+
+# Test files
+test_*.py
+*_test.py
+tests/
+
+# Development files
+.env.example
+.env.local
+*.csv
+received_payloads/
+output/
+results/

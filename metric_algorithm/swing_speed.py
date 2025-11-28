@@ -353,6 +353,64 @@ def speed_2d(points_xy: np.ndarray, fps: Optional[int]):
     v = pd.Series(v).fillna(method="ffill").fillna(0).to_numpy()
     return v, unit
 
+
+def run_from_context(ctx: dict):
+    """Runner hook for controller: write metric CSVs and create overlay mp4 for swing_speed.
+
+    Minimal implementation: if `wide2`/`wide3` exist, write CSVs and attempt to
+    build an overlay mp4 from `ctx['img_dir']` or `dest_dir/img` and return
+    `overlay_mp4`. Upload to S3 if configured.
+    """
+    try:
+        from .runner_utils import write_df_csv, images_to_mp4, upload_overlay_to_s3, normalize_result
+    except Exception:
+        try:
+            from metric_algorithm.runner_utils import write_df_csv, images_to_mp4, upload_overlay_to_s3, normalize_result
+        except Exception:
+            def normalize_result(x):
+                return x
+
+    out = {}
+    try:
+        dest = Path(ctx.get('dest_dir') or ctx.get('dest') or '.')
+        job_id = str(ctx.get('job_id') or ctx.get('job') or 'job')
+        metric = 'swing_speed'
+        wide2 = ctx.get('wide2')
+        wide3 = ctx.get('wide3')
+        try:
+            if wide2 is not None:
+                out['metrics_csv'] = write_df_csv(wide2, dest, job_id, metric)
+            elif wide3 is not None:
+                out['metrics_csv'] = write_df_csv(wide3, dest, job_id, metric)
+        except Exception:
+            pass
+
+        try:
+            img_dir = Path(ctx.get('img_dir') or (Path(dest) / 'img'))
+            imgs = []
+            if img_dir.exists() and img_dir.is_dir():
+                imgs = sorted([p for p in img_dir.iterdir() if p.suffix.lower() in ('.jpg', '.jpeg', '.png')])
+            if not imgs:
+                op_dir = Path(dest) / 'openpose_img'
+                if op_dir.exists() and op_dir.is_dir():
+                    imgs = sorted([p for p in op_dir.iterdir() if p.suffix.lower() in ('.jpg', '.jpeg', '.png')])
+            if imgs:
+                out_mp4 = Path(dest) / f"{job_id}_{metric}_overlay.mp4"
+                created, used = images_to_mp4(imgs, out_mp4, fps=float(ctx.get('fps', 30)), resize=None, filter_rendered=True, write_debug=True)
+                if created:
+                    out['overlay_mp4'] = str(out_mp4)
+                    try:
+                        s3info = upload_overlay_to_s3(str(out_mp4), job_id, metric)
+                        if s3info:
+                            out['overlay_s3'] = s3info
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+    except Exception as e:
+        out['error'] = str(e)
+    return normalize_result(out)
+
 def _pair_distance_px_series_2d(df: pd.DataFrame, joint_a: str, joint_b: str) -> np.ndarray:
     """2D에서 두 관절 사이의 프레임별 거리(px) 시계열을 계산(보간/ffill/bfill 포함)."""
     A = get_xy_cols_2d(df, joint_a)
@@ -1102,6 +1160,7 @@ def run_from_context(ctx: dict):
                     out_obj = {
                         'job_id': job_id_local,
                         'dimension': '3d',
+                        'overlay_mp4': out.get('overlay_mp4'),
                         'metrics': {
                             'swing_speed': {
                                 'summary': summary,
@@ -1142,6 +1201,7 @@ def run_from_context(ctx: dict):
                         out_obj = {
                             'job_id': job_id_local,
                             'dimension': '2d',
+                            'overlay_mp4': out.get('overlay_mp4'),
                             'metrics': {
                                 'swing_speed': {
                                     'summary': summary,
@@ -1152,9 +1212,9 @@ def run_from_context(ctx: dict):
                             }
                         }
                     else:
-                        out_obj = {'job_id': job_id_local, 'dimension': '2d', 'metrics': {'swing_speed': {'summary': out.get('summary', {}), 'metrics_data': {'swing_speed_timeseries': {}}}}}
+                        out_obj = {'job_id': job_id_local, 'dimension': '2d', 'overlay_mp4': out.get('overlay_mp4'), 'metrics': {'swing_speed': {'summary': out.get('summary', {}), 'metrics_data': {'swing_speed_timeseries': {}}}}}
             else:
-                out_obj = {'job_id': job_id_local, 'dimension': '2d', 'metrics': {'swing_speed': {'summary': out.get('summary', {}), 'metrics_data': {'swing_speed_timeseries': {}}}}}
+                out_obj = {'job_id': job_id_local, 'dimension': '2d', 'overlay_mp4': out.get('overlay_mp4'), 'metrics': {'swing_speed': {'summary': out.get('summary', {}), 'metrics_data': {'swing_speed_timeseries': {}}}}}
 
             try:
                 out_json.write_text(__import__('json').dumps(out_obj, ensure_ascii=False, indent=2), encoding='utf-8')
