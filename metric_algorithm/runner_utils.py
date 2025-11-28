@@ -31,24 +31,57 @@ except Exception:
 
 
 def normalize_value(v: Any):
-    """Recursively convert numpy/pandas types to Python built-ins for JSON serialization."""
+    """Recursively convert numpy/pandas types to Python built-ins for JSON serialization.
+    
+    NaN, Inf, -Inf을 None으로 변환하여 프론트엔드 호환성 보장.
+    """
     # numpy scalar
     if isinstance(v, (_np.generic,)):
         try:
-            return v.item()
+            val = v.item()
+            # Check for NaN/Inf
+            if isinstance(val, float):
+                if _np.isnan(val) or _np.isinf(val):
+                    return None
+            return val
         except Exception:
-            return float(v)
+            try:
+                val = float(v)
+                if _np.isnan(val) or _np.isinf(val):
+                    return None
+                return val
+            except Exception:
+                return None
+
+    # Check for NaN/Inf in float
+    if isinstance(v, float):
+        if _np.isnan(v) or _np.isinf(v):
+            return None
+        return v
 
     # numpy array -> list
     if isinstance(v, _np.ndarray):
-        return v.tolist()
+        try:
+            lst = v.tolist()
+            # Recursively clean NaN/Inf from list
+            return _clean_nan_inf_recursive(lst)
+        except Exception:
+            return None
 
     # pandas
     if isinstance(v, (_pd.Series,)):
-        return v.tolist()
+        try:
+            lst = v.tolist()
+            return _clean_nan_inf_recursive(lst)
+        except Exception:
+            return None
     if isinstance(v, (_pd.DataFrame,)):
         # convert DataFrame to list-of-records (shallow)
-        return v.where(_pd.notnull(v), None).to_dict(orient="records")
+        try:
+            result = v.where(_pd.notnull(v), None).to_dict(orient="records")
+            return _clean_nan_inf_recursive(result)
+        except Exception:
+            return None
 
     # dict/list/tuple
     if isinstance(v, dict):
@@ -57,7 +90,7 @@ def normalize_value(v: Any):
         return [normalize_value(x) for x in v]
 
     # basic types
-    if isinstance(v, (str, int, float, bool)) or v is None:
+    if isinstance(v, (str, int, bool)) or v is None:
         return v
 
     # fallback: try to stringify
@@ -65,6 +98,32 @@ def normalize_value(v: Any):
         return str(v)
     except Exception:
         return None
+
+
+def _clean_nan_inf_recursive(obj):
+    """Recursively replace NaN/Inf with None in nested structures."""
+    if isinstance(obj, dict):
+        return {k: _clean_nan_inf_recursive(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [_clean_nan_inf_recursive(item) for item in obj]
+    elif isinstance(obj, float):
+        if _np.isnan(obj) or _np.isinf(obj):
+            return None
+        return obj
+    return obj
+
+
+def _safe_num_to_python(x):
+    """Convert numpy/float values to plain Python numbers or None for non-finite.
+
+    This ensures JSON serialization produces `null` instead of `NaN`.
+    프론트엔드 호환성: NaN/Inf는 None(null)으로 변환
+    """
+    try:
+        xf = float(x)
+    except Exception:
+        return None
+    return xf if _np.isfinite(xf) else None
 
 
 def normalize_result(obj: Any) -> Any:

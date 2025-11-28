@@ -154,15 +154,47 @@ def _detect_person_bbox_from_video(video_path: Path, detect_fn, sample_fraction:
 # ============================================================================
 
 
+def _convert_nan_to_none(obj):
+    """Recursively convert NaN, Inf, -Inf to None (null in JSON).
+    
+    프론트엔드가 JSON의 NaN을 처리하지 못하므로, 
+    모든 NaN/Inf를 None으로 변환하여 null로 직렬화되도록 함.
+    numpy scalar도 처리.
+    """
+    if isinstance(obj, float):
+        if np.isnan(obj) or np.isinf(obj):
+            return None
+        return obj
+    elif isinstance(obj, (np.floating, np.integer)):
+        # numpy scalar 타입
+        try:
+            val = float(obj)
+            if np.isnan(val) or np.isinf(val):
+                return None
+            return val
+        except Exception:
+            return None
+    elif isinstance(obj, dict):
+        return {k: _convert_nan_to_none(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [_convert_nan_to_none(item) for item in obj]
+    elif isinstance(obj, tuple):
+        return tuple(_convert_nan_to_none(item) for item in obj)
+    return obj
+
+
 def _safe_write_json(path: Path, obj: dict):
     """Atomically write JSON to `path` by writing to a temp file and replacing.
 
-    Uses json.dump with default=str so Path objects won't break serialization.
+    Uses custom JSON encoder that converts NaN/Inf to null.
     """
     try:
+        # Convert all NaN/Inf to None before serialization
+        obj_clean = _convert_nan_to_none(obj)
+        
         tmp = Path(str(path) + '.tmp')
         with tmp.open('w', encoding='utf-8') as f:
-            json.dump(obj, f, ensure_ascii=False, indent=2, default=str)
+            json.dump(obj_clean, f, ensure_ascii=False, indent=2, default=str)
         # atomic replace
         try:
             tmp.replace(path)
@@ -172,8 +204,9 @@ def _safe_write_json(path: Path, obj: dict):
     except Exception:
         # best-effort: try non-atomic write
         try:
+            obj_clean = _convert_nan_to_none(obj)
             with path.open('w', encoding='utf-8') as f:
-                json.dump(obj, f, ensure_ascii=False, indent=2, default=str)
+                json.dump(obj_clean, f, ensure_ascii=False, indent=2, default=str)
         except Exception:
             pass
 
@@ -868,6 +901,44 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
                 # CRITICAL: JSON still contains COCO-18, must remap to COCO-17
                 _IDX_MAP_18_TO_17 = [0, 15, 14, 17, 16, 5, 2, 6, 3, 7, 4, 11, 8, 12, 9, 13, 10]
                 json_paths = sorted([p for p in output_json_dir.iterdir() if p.suffix == '.json'])
+                
+                # CRITICAL: Apply early interpolation (matching 2D path)
+                # Parse JSON to build frames_keypoints FIRST, then interpolate (STGCN 입력 통일)
+                frames_keypoints_3d = []  # list[frame][joint] -> [x,y,c]
+                for jp in json_paths:
+                    with jp.open('r', encoding='utf-8') as f:
+                        jdata = json.load(f)
+                    raw_people = jdata.get('people', [])
+                    if not raw_people:
+                        # No person detected → empty frame
+                        frames_keypoints_3d.append([])
+                    else:
+                        # Take first person only (matching 2D path)
+                        kps = raw_people[0].get('pose_keypoints_2d', [])
+                        person_18 = np.array(kps).reshape(-1, 3)
+                        # Remap COCO-18 to COCO-17
+                        if person_18.shape[0] >= 18:
+                            person_17 = person_18[_IDX_MAP_18_TO_17, :]
+                        else:
+                            person_17 = person_18
+                        person = [[float(x), float(y), float(c)] for (x, y, c) in person_17]
+                        frames_keypoints_3d.append(person)
+                
+                # Apply interpolation (matching 2D path exactly)
+                interp_3d = interpolate_sequence(
+                    frames_keypoints_3d,
+                    conf_thresh=0.0,
+                    method='linear',
+                    fill_method='zero',
+                    limit=None
+                )
+                
+                if not interp_3d:
+                    raise RuntimeError('Interpolated 3D sequence empty')
+                
+                # Convert interpolated sequence to result_by_frame format (for consistency)
+                result_by_frame = [[frame] for frame in interp_3d]
+                
                 rows = []
                 # Build a sorted list of depth files as a robust fallback mapping
                 depth_files = sorted([p for p in depth_dir.iterdir() if p.suffix == '.npy'])
@@ -915,7 +986,7 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
                 # per-frame debug entries to help diagnose NaN Z values
                 frame_depth_debug = []
 
-                for frame_idx, jp in enumerate(json_paths):
+                for frame_idx, (jp, interpolated_frame) in enumerate(zip(json_paths, interp_3d)):
                     # depth file expected to be zero-padded with same index (e.g., 000001.npy)
                     depth_path = depth_dir / f"{frame_idx:06d}.npy"
                     if not depth_path.exists():
@@ -939,22 +1010,10 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
                         # register debug info and continue (Z will be NaN)
                         depth_m = None
 
-                    with jp.open('r', encoding='utf-8') as f:
-                        jdata = json.load(f)
-                    raw_people = jdata.get('people', [])
-                    ppl = []
-                    for person_idx, p in enumerate(raw_people):
-                        if 'pose_keypoints_2d' in p:
-                            kps = p['pose_keypoints_2d']
-                            person_18 = [kps[idx:idx+3] for idx in range(0, len(kps), 3)]
-                            # Remap OP-18 to COCO-17 (matching local preprocessing)
-                            if len(person_18) >= 18:
-                                person = [person_18[op_idx] for op_idx in _IDX_MAP_18_TO_17]
-                            else:
-                                person = person_18
-                            person = _sanitize_person_list(person)
-                            ppl.append(person)
-                    result_by_frame.append(ppl)
+                    # Use interpolated 2D coordinates (already processed and interpolated)
+                    # Extract from interpolated_frame which is [x, y, c] for each joint
+                    person = interpolated_frame  # This is already the COCO-17 format with interpolation applied
+                    ppl = [person]  # Wrap in list to match result_by_frame format
 
                     # compute 3D coordinates using intrinsics (found earlier in the tmp tree)
                     # NOTE: do not reassign `intr` here; it was discovered earlier and should persist
@@ -965,7 +1024,7 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
                             X, Y, Zm = (np.nan, np.nan, np.nan)
                             sample_info = {
                                 'frame': frame_idx,
-                                'json_name': jp.name,
+                                'json_name': f'{frame_idx:06d}.json',
                                 'depth_name': depth_path.name if depth_path is not None else None,
                                 'person_idx': person_idx,
                                 'joint_idx': joint_idx,
