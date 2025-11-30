@@ -70,7 +70,7 @@ def load_cfg(p: Path):
 def _interpolate(s: pd.Series) -> pd.Series:
     s2 = s.astype(float)
     s2 = s2.interpolate(method='linear', limit_direction='both')
-    s2 = s2.fillna(method='ffill').fillna(method='bfill')
+    s2 = s2.ffill().bfill()
     return s2
 
 def _ema(arr: np.ndarray, alpha: float) -> np.ndarray:
@@ -82,7 +82,7 @@ def _ema(arr: np.ndarray, alpha: float) -> np.ndarray:
             continue
         prev = v if prev is None else (alpha * v + (1 - alpha) * prev)
         y[i] = prev
-    return pd.Series(y).fillna(method='ffill').fillna(method='bfill').to_numpy()
+    return pd.Series(y).ffill().bfill().to_numpy()
 
 def smooth_df_2d(df: pd.DataFrame, method: str, window: int, alpha: float, fps: Optional[int]) -> pd.DataFrame:
     cols_map = parse_joint_axis_map_from_columns(df.columns, prefer_2d=True)
@@ -342,7 +342,14 @@ def run_from_context(ctx: dict):
     try:
         dest = Path(ctx.get('dest_dir', '.'))
         job_id = ctx.get('job_id', 'job')
-        fps = int(ctx.get('fps', 30))
+        # CRITICAL: Get fps from context; do NOT default to 30
+        # fps must be provided by controller based on video/intrinsics metadata
+        fps_ctx = ctx.get('fps')
+        if fps_ctx is None:
+            print(f"[WARN] shoulder_sway: fps not provided in context, using fallback 30")
+            fps = 30
+        else:
+            fps = int(fps_ctx)
         wide2 = ctx.get('wide2')
 
         # If running in 3D mode, a wide3 DataFrame may be available but wide2 is not.

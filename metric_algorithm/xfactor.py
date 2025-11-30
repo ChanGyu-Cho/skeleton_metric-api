@@ -3,19 +3,28 @@
 # -*- coding: utf-8 -*-
 X-Factor 전용 분석기
 
-요청된 단계별 규칙을 그대로 구현합니다:
+X-Factor의 정의 (골프):
+  - 상체(어깨라인)와 하체(골반라인)의 회전 각도 차이를 나타냄
+  - 항상 양수 범위: 0°~180° (절댓값 기반)
+  - 이상적 범위: 25°~50° (특히 45°에 최적화)
+
+계산 단계:
  1) 3D 좌표 읽기 (L/R Shoulder, L/R Hip)
  2) 어깨선/골반선 벡터 생성 (오른쪽-왼쪽)
  3) 프레임별 벡터 방향 일관화 (dot<0이면 부호 반전)
- 4) 3개 평면(X-Z, X-Y, Y-Z)에서 회전각 계산(atan2)
+ 4) 3개 평면(X-Z, X-Y, Y-Z)에서 회전각 계산 (atan2)
  5) 각도 언랩(np.unwrap)
- 6) X-Factor = shoulder_angle - pelvis_angle
+ 6) X-Factor = |shoulder_angle - pelvis_angle| (절댓값 기반)
  7) 스무딩(Median5 + Moving5)
- 8) 클리핑([-90, 90])
+ 8) 범위 정규화([0, 180])
  9) 임팩트 탐지 (RWrist_X3D가 stance_mid를 +방향으로 교차하는 첫 프레임)
-10) 임팩트 전 최대값/프레임, 임팩트 시 값
+10) 임팩트 전 최대값/프레임, 임팩트 시 값 (양수 범위만 계산)
 11) 최적 평면 자동 선택: 5<median<80 후보 중 IQR(q90-q10) 최소
 12) 결과 저장(JSON) 및 타임시리즈 CSV
+
+버전 히스토리:
+  - v1.0: 초기 구현 (음수 범위 지원 - 부정확함)
+  - v2.0: 절댓값 기반 (양수 범위만) - 골프 X-Factor 정의에 맞춤
 """
 import argparse
 from pathlib import Path
@@ -108,7 +117,7 @@ def _gaussian_kernel(window: int, sigma: Optional[float] = None) -> np.ndarray:
 def _gaussian(series: pd.Series, window: int, sigma: Optional[float]) -> pd.Series:
     vals = series.to_numpy(dtype=float, copy=True)
     mask = np.isnan(vals)
-    tmp = pd.Series(vals).fillna(method='ffill').fillna(method='bfill').to_numpy()
+    tmp = pd.Series(vals).ffill().bfill().to_numpy()
     k = _gaussian_kernel(window, sigma)
     sm = np.convolve(tmp, k, mode='same')
     sm[mask] = np.nan
@@ -130,7 +139,7 @@ def _hampel(series: pd.Series, window: int, n_sigma: float = 3.0) -> pd.Series:
 def _one_euro(series: pd.Series, fps: float, min_cutoff: float = 1.0, beta: float = 0.007, d_cutoff: float = 1.0) -> pd.Series:
     vals = series.to_numpy(dtype=float, copy=True)
     mask = np.isnan(vals)
-    tmp = pd.Series(vals).fillna(method='ffill').fillna(method='bfill').to_numpy()
+    tmp = pd.Series(vals).ffill().bfill().to_numpy()
     dt = 1.0 / float(fps) if fps and fps > 0 else 1.0
     def alpha(cutoff):
         tau = 1.0 / (2.0 * np.pi * float(cutoff)) if cutoff and cutoff > 0 else 1.0
@@ -204,9 +213,29 @@ def ensure_direction_continuity(V: np.ndarray) -> np.ndarray:
     return out
 
 def angles_deg_for_plane(V: np.ndarray, axis_a: int, axis_b: int) -> np.ndarray:
+    """
+    벡터 집합의 방향 각도를 계산합니다.
+    
+    Return: [-180, 180] 범위의 signed 각도 배열
+    (절댓값은 나중에 X-Factor 계산 후에 적용)
+    """
     va, vb = V[:, axis_a], V[:, axis_b]
-    ang_unwrapped = np.unwrap(np.arctan2(vb, va))
-    return np.degrees(ang_unwrapped)
+    # atan2: -180 ~ 180 범위
+    ang_raw = np.arctan2(vb, va)
+    ang_unwrapped = np.unwrap(ang_raw)
+    ang_deg = np.degrees(ang_unwrapped)
+    # [-180, 180] 범위로 정규화 (부호 있는 각도 유지)
+    ang_deg = np.where(ang_deg > 180, ang_deg - 360, ang_deg)
+    ang_deg = np.where(ang_deg < -180, ang_deg + 360, ang_deg)
+    return ang_deg
+
+def normalize_angle_to_180(angle: float) -> float:
+    """각도를 [-180, 180] 범위로 정규화 (여러 번 360 순환 처리)"""
+    while angle > 180:
+        angle -= 360
+    while angle < -180:
+        angle += 360
+    return angle
 
 def smooth_median_then_moving(x: np.ndarray, w: int = 5) -> np.ndarray:
     s = pd.Series(x)
@@ -248,21 +277,27 @@ def compute_xfactor(df: pd.DataFrame) -> Dict[str, any]:
     for name, ax_a, ax_b in planes:
         shoulder_angle = angles_deg_for_plane(shoulder_vec, ax_a, ax_b)
         pelvis_angle   = angles_deg_for_plane(pelvis_vec, ax_a, ax_b)
+        # X-Factor raw = 상체 각도 - 하체 각도 (부호 있음)
         xf_raw = shoulder_angle - pelvis_angle
-        # 7) 스무딩
+        # [-180, 180] 범위 정규화 (여러 번 순환 처리)
+        xf_raw = np.array([normalize_angle_to_180(x) for x in xf_raw])
+        # 7) 스무딩 (여전히 부호 있는 값)
         xf_smooth = smooth_median_then_moving(xf_raw, w=5)
-        # 8) 클리핑
-        xf_smooth = np.clip(xf_smooth, -90.0, 90.0)
+        # 8) 절댓값 변환
+        xf_smooth = np.abs(xf_smooth)
+        # 최종 안전장치: 음수 제거 및 [0, 180] 범위 강제
+        xf_smooth = np.clip(xf_smooth, 0, 180)
         xf_by_plane[name] = xf_smooth
 
     # 9) 임팩트 프레임 탐지
     impact_idx = detect_impact_by_crossing(df)
 
     # 10) 임팩트 전 최대/프레임, 임팩트 시 값 (평면별 통계)
+    # X-Factor는 절댓값이므로 항상 양수
     stats: Dict[str, Dict[str, float]] = {}
     for name, xf in xf_by_plane.items():
         upto = max(min(impact_idx, len(xf) - 1), 0)
-        pre = np.abs(xf[:upto+1])
+        pre = xf[:upto+1]  # 절댓값이므로 abs() 제거
         if pre.size == 0 or np.all(np.isnan(pre)):
             xf_max = np.nan; xf_max_frame = 0
         else:
@@ -276,11 +311,12 @@ def compute_xfactor(df: pd.DataFrame) -> Dict[str, any]:
         }
 
     # 11) 최적 평면 자동 선택
+    # X-Factor는 절댓값이므로 0~180 범위에서 선택 (5~80은 실제로는 의미있는 X-Factor 범위)
     best_plane = None
     best_spread = None
     for name, xf in xf_by_plane.items():
         upto = max(min(impact_idx, len(xf) - 1), 0)
-        pre_vals = np.abs(xf[:upto+1])
+        pre_vals = xf[:upto+1]  # 절댓값이므로 abs() 제거
         if pre_vals.size == 0 or np.all(np.isnan(pre_vals)):
             continue
         q10, q90 = np.nanpercentile(pre_vals, [10, 90])
@@ -307,11 +343,16 @@ def compute_xfactor(df: pd.DataFrame) -> Dict[str, any]:
 
 def categorize_xfactor(deg: float) -> Dict[str, object]:
     """X-Factor 등급 및 코멘트 생성 (기준: 임팩트 전 최대값)
+    
+    골프 X-Factor 정의: 상체(어깨) 회전각도 - 하체(골반) 회전각도 의 절댓값
+    - 항상 양수 범위: 0°~180°
+    - 이상적 범위: 약 25°–50° (일반적으로 45°가 최적)
+    
     구간:
-      - < 25° (낮음)
-      - 25°–40° (적정)
-      - 40°–50° (높음)
-      - > 50° (과도)
+      - 0°–25° (낮음: 파워 손실)
+      - 25°–45° (적정: 이상적)
+      - 45°–50° (높음: 좋은 상태)
+      - > 50° (과도: 불안정 위험)
     """
     if deg is None or not np.isfinite(deg):
         return {
@@ -322,38 +363,47 @@ def categorize_xfactor(deg: float) -> Dict[str, object]:
             ]
         }
 
-    if deg < 25:
+    # 절댓값 기반 평가 (항상 양수이므로 deg = abs_deg)
+    abs_deg = abs(deg)
+    
+    if abs_deg < 25:
         return {
-            'range': '< 25°',
+            'range': f'{abs_deg:.1f}° (낮음)',
             'label': '낮음',
             'messages': [
-                '상체와 하체의 회전 차이가 작아 파워 손실이 있습니다. 어깨 회전을 더 크게 가져가 보세요.',
-                '백스윙 시 상체가 골반보다 더 많이 돌아가도록 연습해 보세요.'
+                '상체와 하체의 회전 차이가 작아 파워 손실이 있습니다.',
+                '어깨 회전을 더 크게 가져가고, 골반은 상대적으로 덜 돌도록 연습해 보세요.',
+                '백스윙 시 상체가 골반보다 훨씬 더 많이 돌아가는 분리 회전을 의식하세요.'
             ]
         }
-    elif 25 <= deg <= 40:
+    elif 25 <= abs_deg <= 45:
         return {
-            'range': '25°–40°',
+            'range': f'{abs_deg:.1f}° (적정)',
             'label': '적정',
             'messages': [
-                '이상적인 X-Factor 범위입니다. 상체·하체 분리 회전이 잘 이루어져 파워 전달이 효율적이에요.'
+                '이상적인 X-Factor 범위입니다. 상체·하체 분리 회전이 잘 이루어져 파워 전달이 효율적입니다.',
+                '현재의 회전 패턴을 유지하면서 일관성을 개선하는 것에 집중하세요.'
             ]
         }
-    elif 40 < deg <= 50:
+    elif 45 < abs_deg <= 50:
         return {
-            'range': '40°–50°',
+            'range': f'{abs_deg:.1f}° (높음)',
             'label': '높음',
             'messages': [
-                '충분한 꼬임으로 비거리 향상에 유리합니다. 다만 허리·코어의 부담이 커질 수 있으니 유연성 훈련을 병행하세요.'
+                '충분한 꼬임으로 비거리 향상에 유리합니다.',
+                '다만 허리·코어의 부담이 커질 수 있으니 유연성 훈련을 병행하세요.',
+                '스윙 속도는 빠르지만 안정성을 잃지 않는 범위에서 진행하세요.'
             ]
         }
-    else:  # > 50
+    else:  # abs_deg > 50
         return {
-            'range': '> 50°',
+            'range': f'{abs_deg:.1f}° (과도)',
             'label': '과도',
             'messages': [
-                '상체 꼬임이 과도하여 임팩트 타이밍이 흔들릴 수 있습니다. 백스윙을 조금 줄여 보세요.',
-                '허리와 골반이 따로 노는 느낌이 강하면, 회전 범위를 조절해 안정감을 찾아보세요.'
+                '상체 꼬임이 과도하여 임팩트 타이밍이 흔들릴 수 있습니다.',
+                '백스윙을 조금 줄이거나 골반 회전을 더 늘려 적절한 분리 회전을 찾아보세요.',
+                '허리와 골반이 따로 노는 느낌이 강하면, 회전 범위를 조절해 안정감을 찾아보세요.',
+                '과도한 꼬임은 다운스윙에서 급한 풀림을 초래하여 임팩트 정확도를 해칠 수 있습니다.'
             ]
         }
 
@@ -404,6 +454,7 @@ def overlay_xfactor_video(
     first = cv2.imread(images[0])
     h, w = first.shape[:2]
     ensure_dir(out_mp4.parent)
+    print(f"[DEBUG] xfactor: cv2.VideoWriter call: fps={fps}, size=({w}, {h})")
     writer = cv2.VideoWriter(str(out_mp4), cv2.VideoWriter_fourcc(*codec), fps, (w, h))
     if not writer.isOpened():
         raise RuntimeError(f"VideoWriter open failed: {out_mp4}")
@@ -582,21 +633,36 @@ def run_from_context(ctx: dict):
     반환(dict):
       - summary: X-Factor 요약(선택 평면, 임팩트 전 최대/프레임, 임팩트 시 값, 임팩트 프레임, 카테고리 등)
       - timeseries_csv: 선택 평면 타임시리즈 CSV 경로 (선택)
+      - timeseries_json: 선택 평면 타임시리즈 JSON 객체 (프레임별 xfactor_deg)
       - overlay_mp4: 오버레이 비디오 경로 (2D가 있을 때)
       - dimension: '3d'
       - errors: {'metrics': str?, 'overlay': str?}
     """
+    result = None
+    xf_by_plane = None
+    job_id = None
+    dest = None
+    
     try:
         dest = Path(ctx.get('dest_dir', '.'))
         job_id = str(ctx.get('job_id', ctx.get('job', 'job')))
-        fps = int(ctx.get('fps', 30))
+        # CRITICAL: Get fps from context; do NOT default to 30
+        # fps must be provided by controller based on video/intrinsics metadata
+        fps_ctx = ctx.get('fps')
+        if fps_ctx is None:
+            print(f"[WARN] xfactor.run_from_context: fps not provided in context, using fallback 30")
+            fps = 30
+        else:
+            fps = int(fps_ctx)
+        print(f"[DEBUG] xfactor.run_from_context: ctx.get('fps') = {fps_ctx}")
+        print(f"[DEBUG] xfactor.run_from_context: fps = {fps}")
         codec = str(ctx.get('codec', 'mp4v'))
         wide3 = ctx.get('wide3')
         wide2 = ctx.get('wide2')
         img_dir = Path(ctx.get('img_dir', dest))
         ensure_dir(dest)
 
-        out = {'summary': {}, 'timeseries_csv': None, 'overlay_mp4': None, 'dimension': '3d', 'errors': {}}
+        out = {'summary': {}, 'timeseries_csv': None, 'timeseries_json': {}, 'overlay_mp4': None, 'dimension': '3d', 'errors': {}}
 
         if wide3 is None:
             out['errors']['metrics'] = 'wide3 (3D DataFrame) is required for xfactor.'
@@ -614,17 +680,31 @@ def run_from_context(ctx: dict):
             out['summary'] = result
         except Exception as e:
             out['errors']['metrics'] = str(e)
+            return out
 
-        # 선택 평면 타임시리즈 CSV 저장 (선택)
-        try:
-            chosen = out['summary'].get('chosen_plane') or 'X-Z'
-            series = xf_by_plane.get(chosen)
-            if series is not None:
+        # 선택 평면 타임시리즈 JSON 및 CSV 저장
+        chosen = result.get('chosen_plane', 'X-Z')
+        if chosen in xf_by_plane:
+            series = xf_by_plane[chosen]
+            # 최종 안전장치: 음수 제거 및 [0, 180] 범위 강제
+            series = np.abs(series)
+            series = np.clip(series, 0, 180)
+            
+            # JSON 형식으로 timeseries 저장 (항상 양수)
+            frames_obj = {str(i): {"xfactor_deg": (float(v) if np.isfinite(v) else None)} for i, v in enumerate(series)}
+            
+            # metrics_data 구조로 저장 (다른 메트릭과 일관성)
+            out['metrics_data'] = {
+                'xfactor_timeseries': frames_obj
+            }
+            
+            # CSV 저장 (선택)
+            try:
                 csv_path = dest / f"{job_id}_xfactor_timeseries.csv"
                 pd.DataFrame({'frame': range(len(series)), 'xfactor_deg': series}).to_csv(csv_path, index=False)
                 out['timeseries_csv'] = str(csv_path)
-        except Exception as e:
-            out['errors']['timeseries'] = str(e)
+            except Exception as e:
+                out['errors']['timeseries_csv'] = str(e)
 
         # 2D 오버레이 (있을 때만)
         try:
@@ -657,7 +737,6 @@ def run_from_context(ctx: dict):
                 else:
                     df_overlay_sm = wide2
                 # 오버레이 비디오 생성
-                chosen = out['summary'].get('chosen_plane') or 'X-Z'
                 xfactor_vals = xf_by_plane.get(chosen, np.zeros(len(df_overlay_sm)))
                 out_mp4 = dest / f"{job_id}_xfactor_overlay.mp4"
                 overlay_xfactor_video(
@@ -672,49 +751,17 @@ def run_from_context(ctx: dict):
                     joints=["LShoulder","RShoulder","LHip","RHip"],
                 )
                 out['overlay_mp4'] = str(out_mp4)
+                # Add fps_info for frontend
+                out['fps_info'] = {
+                    'original_fps': fps,
+                    'output_fps': min(fps, 60)
+                }
         except Exception as e:
             out['errors']['overlay'] = str(e)
 
         return out
     except Exception as e:
         return {'error': str(e)}
-    finally:
-        # Attempt to also write the rich JSON summary matching main() when possible
-        try:
-            if 'result' in locals() and 'xf_by_plane' in locals():
-                chosen = result.get('chosen_plane') or 'X-Z'
-                xfactor_series = xf_by_plane.get(chosen, [])
-                frames_obj = {str(i): {"xfactor_deg": (float(v) if np.isfinite(v) else None)} for i, v in enumerate(xfactor_series)}
-                job_id_local = job_id if 'job_id' in locals() else None
-                out_obj = {
-                    "job_id": job_id_local,
-                    "dimension": "3d",
-                    "metrics": {
-                        "xfactor": {
-                            "summary": {
-                                "chosen_plane": result.get("chosen_plane"),
-                                "xfactor_max_deg": result.get("xfactor_max_deg"),
-                                "xfactor_max_frame": result.get("xfactor_max_frame"),
-                                "xfactor_at_impact_deg": result.get("xfactor_at_impact_deg"),
-                                "impact_frame": result.get("impact_frame"),
-                                "xfactor_range": result.get("xfactor_range"),
-                                "xfactor_category": result.get("xfactor_category"),
-                                "xfactor_advice": result.get("xfactor_advice", []),
-                                "unit": "deg"
-                            },
-                            "metrics_data": {
-                                "xfactor_timeseries": frames_obj
-                            }
-                        }
-                    }
-                }
-                try:
-                    out_json = Path(dest) / "xfactor_metric_result.json"
-                    out_json.write_text(json.dumps(out_obj, ensure_ascii=False, indent=2), encoding='utf-8')
-                except Exception:
-                    pass
-        except Exception:
-            pass
 # =========================================================
 # 메인
 # =========================================================

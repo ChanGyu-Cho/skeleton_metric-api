@@ -52,6 +52,11 @@ def run_metrics_from_context(ctx: dict, dest_dir: str, job_id: str, dimension: s
 	import numpy as _np
 	from . import utils_io as _utils
 
+	# Debug: Check fps in context
+	print(f"[DEBUG] run_metrics_from_context: ctx has 'fps' key: {'fps' in ctx}")
+	if 'fps' in ctx:
+		print(f"[DEBUG] run_metrics_from_context: fps value = {ctx.get('fps')}")
+
 	out = {'job_id': job_id, 'dimension': dimension, 'metrics': {}}
 	dest_dir = _Path(dest_dir)
 	dest_dir.mkdir(parents=True, exist_ok=True)
@@ -163,11 +168,16 @@ def run_metrics_from_context(ctx: dict, dest_dir: str, job_id: str, dimension: s
 		try:
 			if _k in ctx and ctx.get(_k) is not None:
 				module_ctx[_k] = ctx.get(_k)
+				if _k == 'fps':
+					print(f"[DEBUG] Forwarding fps={module_ctx[_k]} to module_ctx")
 		except Exception:
 			# ignore failures; leave key absent so modules use their defaults
 			pass
-
-	# Run each metric module's standardized runner if present
+	
+	# After loop, check if fps was added
+	print(f"[DEBUG] module_ctx has 'fps' key: {'fps' in module_ctx}")
+	if 'fps' in module_ctx:
+		print(f"[DEBUG] module_ctx['fps'] = {module_ctx['fps']}")
 	for name, mod in METRIC_MODULES.items():
 		try:
 			# Skip xfactor for pure 2D runs: xfactor needs 3D metrics for correct results
@@ -176,6 +186,9 @@ def run_metrics_from_context(ctx: dict, dest_dir: str, job_id: str, dimension: s
 				continue
 			if hasattr(mod, 'run_from_context') and callable(getattr(mod, 'run_from_context')):
 				try:
+					print(f"[DEBUG] Calling {name}.run_from_context with module_ctx:")
+					print(f"[DEBUG]   module_ctx['fps'] = {module_ctx.get('fps', 'NOT SET')}")
+					print(f"[DEBUG]   module_ctx keys = {list(module_ctx.keys())}")
 					res = mod.run_from_context(module_ctx)
 					# If this is a 2D run, ensure modules have a metrics_csv to allow frame_data expansion.
 					if isinstance(res, dict) and str(dimension).lower() == '2d':
@@ -300,6 +313,13 @@ def run_metrics_from_context(ctx: dict, dest_dir: str, job_id: str, dimension: s
 		for name, m in list(out.get('metrics', {}).items()):
 			try:
 				if not isinstance(m, dict):
+					continue
+
+				# **CRITICAL**: If module provided metrics_data (xfactor style timeseries),
+				# preserve it as-is (don't try to convert to frame_data)
+				if 'metrics_data' in m and isinstance(m['metrics_data'], dict):
+					# metrics_data is already in JSON format (e.g., xfactor_timeseries)
+					# Keep it and skip CSV expansion for this module
 					continue
 
 				# Collect candidate CSV paths reported by module. Only consider values that

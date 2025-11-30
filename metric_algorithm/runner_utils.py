@@ -246,14 +246,14 @@ def prepare_overlay_df(df, prefer_2d: bool = True, zero_threshold: float = 0.0):
 
         try:
             sx_interp = sx.interpolate(method='linear', limit_direction='both')
-            sx_interp = sx_interp.fillna(method='ffill').fillna(method='bfill')
+            sx_interp = sx_interp.ffill().bfill()
         except Exception:
-            sx_interp = sx.fillna(method='ffill').fillna(method='bfill')
+            sx_interp = sx.ffill().bfill()
         try:
             sy_interp = sy.interpolate(method='linear', limit_direction='both')
-            sy_interp = sy_interp.fillna(method='ffill').fillna(method='bfill')
+            sy_interp = sy_interp.ffill().bfill()
         except Exception:
-            sy_interp = sy.fillna(method='ffill').fillna(method='bfill')
+            sy_interp = sy.ffill().bfill()
 
         try:
             df2[x_col] = sx_interp
@@ -331,17 +331,31 @@ def upload_overlay_to_s3(local_path: str, job_id: str, metric: str, bucket_envs=
     return {'bucket': bucket, 'key': key}
 
 
-def images_to_mp4(img_paths, out_mp4: str, fps: float = 30.0, resize: tuple = None, filter_rendered: bool = True, write_debug: bool = True):
+def images_to_mp4(img_paths, out_mp4: str, fps: float = None, resize: tuple = None, filter_rendered: bool = True, write_debug: bool = True):
     """Create an mp4 from a list of image paths.
 
     - img_paths: iterable of Path or str
     - out_mp4: destination mp4 path (string)
-    - fps: frames per second
+    - fps: frames per second (default: 30.0 if None)
     - resize: (w,h) tuple to force resize, or None to use first image size
     - filter_rendered: if True skip files with 'render' or 'openpose' in the name
     - write_debug: if True, write a small JSON next to out_mp4 with source info
-    Returns: (created: bool, used_count: int)
+    Returns: (created: bool, used_count: int, original_fps: float, output_fps: float)
     """
+    # Use provided fps, fall back to 30.0 if not specified
+    if fps is None:
+        fps = 30.0
+    
+    original_fps = float(fps)
+    output_fps = float(fps)
+    
+    # Downsample to 60fps if original fps is > 60
+    if output_fps > 60:
+        output_fps = 60.0
+        print(f"[INFO] Downsampling fps from {original_fps} to {output_fps}")
+    
+    # Debug: Check fps parameter
+    print(f"[DEBUG] images_to_mp4: original_fps={original_fps}, output_fps={output_fps}")
     try:
         from pathlib import Path as _Path
         import cv2 as _cv2
@@ -366,7 +380,7 @@ def images_to_mp4(img_paths, out_mp4: str, fps: float = 30.0, resize: tuple = No
         paths = uniq
 
         if not paths:
-            return False, 0
+            return False, 0, original_fps, output_fps
 
         # determine size
         w, h = None, None
@@ -380,19 +394,41 @@ def images_to_mp4(img_paths, out_mp4: str, fps: float = 30.0, resize: tuple = No
                 h, w = im.shape[:2]
                 break
         if w is None or h is None:
-            return False, 0
+            return False, 0, original_fps, output_fps
 
         fourcc = _cv2.VideoWriter_fourcc(*'mp4v')
-        vw = _cv2.VideoWriter(str(out_mp4), fourcc, float(fps), (w, h))
+        print(f"[DEBUG] cv2.VideoWriter call: output_fps={float(output_fps)}, size=({w}, {h})")
+        vw = _cv2.VideoWriter(str(out_mp4), fourcc, float(output_fps), (w, h))
+        
+        # Time-based frame sampling for accurate downsampling
+        # For 90fps → 60fps: we need to sample frames at 60fps intervals from 90fps source
+        # Target frame interval in source time = 1 / 60 seconds = 1/60 seconds
+        # Source frame time = 1 / 90 seconds
+        # So we take frames at indices: 0, 1.5, 3, 4.5, 6, ... (in source frame units)
+        
+        target_frame_interval = original_fps / output_fps if output_fps > 0 else 1.0
+        print(f"[DEBUG] Frame sampling: original_fps={original_fps}, output_fps={output_fps}, target_frame_interval={target_frame_interval:.2f}")
+        
         used = 0
+        frame_idx = 0
+        next_frame_to_write = 0  # Next frame index (in source fps) to write to output
+        
         for p in paths:
             im = _cv2.imread(str(p))
             if im is None:
+                frame_idx += 1
                 continue
-            if im.shape[1] != w or im.shape[0] != h:
-                im = _cv2.resize(im, (w, h))
-            vw.write(im)
-            used += 1
+            
+            # Check if this frame should be written to output
+            # We write frame when frame_idx >= next_frame_to_write
+            if frame_idx >= next_frame_to_write:
+                if im.shape[1] != w or im.shape[0] != h:
+                    im = _cv2.resize(im, (w, h))
+                vw.write(im)
+                used += 1
+                # Next frame to write is shifted by target_frame_interval
+                next_frame_to_write += target_frame_interval
+            frame_idx += 1
         vw.release()
 
         # Ensure MP4 is browser-friendly: transcode to H.264 (libx264) + faststart when ffmpeg is available.
@@ -410,13 +446,22 @@ def images_to_mp4(img_paths, out_mp4: str, fps: float = 30.0, resize: tuple = No
 
         if write_debug:
             try:
-                dbg = {'images_used': used, 'total_candidates': len(paths)}
+                dbg = {
+                    'images_used': used, 
+                    'total_candidates': len(paths), 
+                    'original_fps': original_fps, 
+                    'output_fps': output_fps,
+                    'target_frame_interval': target_frame_interval,
+                    'total_images_processed': frame_idx,
+                    'sampling_ratio': used / frame_idx if frame_idx > 0 else 0
+                }
                 _Path(out_mp4).with_suffix('.debug.json').write_text(_json.dumps(dbg, indent=2), encoding='utf-8')
+                print(f"[INFO] images_to_mp4 complete: used={used}/{frame_idx} frames ({100*used/frame_idx:.1f}%), fps={original_fps}→{output_fps}")
             except Exception:
                 pass
-        return True, used
+        return True, used, original_fps, output_fps
     except Exception:
-        return False, 0
+        return False, 0, original_fps if 'original_fps' in locals() else 30.0, output_fps if 'output_fps' in locals() else 30.0
 
 
 def ensure_mp4_faststart(path: str) -> bool:

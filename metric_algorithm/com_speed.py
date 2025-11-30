@@ -182,9 +182,21 @@ def detect_impact_by_crossing_2d(df: pd.DataFrame, stance_mid: np.ndarray) -> in
     with np.errstate(invalid='ignore'):
         return int(np.nanargmax(w)) if np.any(~np.isnan(w)) else N - 1
 
+def normalize_angle_to_180(angle: float) -> float:
+    """각도를 [-180, 180] 범위로 정규화 (여러 번 360 순환 처리)"""
+    while angle > 180:
+        angle -= 360
+    while angle < -180:
+        angle += 360
+    return angle
+
 def compute_xfactor_by_planes(df: pd.DataFrame) -> Dict[str, np.ndarray]:
     """세 평면(X-Z, X-Y, Y-Z)에서 X-Factor 시퀀스 생성.
     어깨/골반 벡터의 방향 일관화 후 각도(unwrap) 차이.
+    
+    v4.0 수정: 
+    - 각도 차이를 [-180, 180] 범위로 정확히 정규화
+    - 스무딩 후 절댓값 적용 (항상 양수 [0, 180])
     """
     N = len(df)
     Ls = _ensure_np(get_xyz_cols(df, 'LShoulder'), N)
@@ -201,7 +213,12 @@ def compute_xfactor_by_planes(df: pd.DataFrame) -> Dict[str, np.ndarray]:
         ang_sh = angles_deg_for_plane(sh, ax1, ax2)
         ang_pe = angles_deg_for_plane(pe, ax1, ax2)
         xf = ang_sh - ang_pe
+        # v4.0: [-180, 180] 범위로 정규화 (여러 번 순환 처리)
+        xf = np.array([normalize_angle_to_180(x) for x in xf])
         xf = smooth_median_then_moving(xf, w=5)
+        # v4.0: 절댓값 적용 (X-Factor는 항상 양수)
+        xf = np.abs(xf)
+        xf = np.clip(xf, 0, 180)
         out[name] = xf
     return out
 
@@ -388,9 +405,24 @@ def run_from_context(ctx: dict):
                     imgs = sorted([p for p in op_dir.iterdir() if p.suffix.lower() in ('.jpg', '.jpeg', '.png')])
             if imgs:
                 out_mp4 = Path(dest) / f"{job_id}_{metric}_overlay.mp4"
-                created, used = images_to_mp4(imgs, out_mp4, fps=float(ctx.get('fps', 30)), resize=None, filter_rendered=True, write_debug=True)
+                # CRITICAL: Get fps from context; do NOT default to 30
+                # fps must be provided by controller based on video/intrinsics metadata
+                fps_ctx = ctx.get('fps')
+                if fps_ctx is None:
+                    print(f"[WARN] com_speed: fps not provided in context, using fallback 30")
+                    fps_value = 30
+                else:
+                    fps_value = fps_ctx
+                print(f"[DEBUG] com_speed: ctx.get('fps') = {fps_ctx}")
+                print(f"[DEBUG] com_speed: float(fps_value) = {float(fps_value)}")
+                created, used, original_fps, output_fps = images_to_mp4(imgs, out_mp4, fps=float(fps_value), resize=None, filter_rendered=True, write_debug=True)
                 if created:
                     out['overlay_mp4'] = str(out_mp4)
+                    # Store fps information for frontend
+                    out['fps_info'] = {
+                        'original_fps': original_fps,
+                        'output_fps': output_fps
+                    }
                     try:
                         s3info = upload_overlay_to_s3(str(out_mp4), job_id, metric)
                         if s3info:
@@ -1447,18 +1479,20 @@ def run_from_context(ctx: dict):
     try:
         dest = Path(ctx.get('dest_dir', '.'))
         job_id = str(ctx.get('job_id', 'job'))
-        # Prefer provided fps; fall back to 30. Accept None (pass-through) if explicit None supplied.
-        _fps_val = ctx.get('fps', None)
-        if _fps_val is None:
+        # Extract fps from context with explicit warning if missing
+        fps_ctx = ctx.get('fps')
+        if fps_ctx is None:
+            print(f"[WARN] com_speed.run_from_context (secondary): fps not provided, using fallback 30")
             fps = 30
         else:
             try:
-                fps = int(_fps_val)
+                fps = int(fps_ctx)
             except Exception:
                 # non-numeric fps -> fallback
                 try:
-                    fps = int(float(_fps_val))
+                    fps = int(float(fps_ctx))
                 except Exception:
+                    print(f"[WARN] com_speed.run_from_context (secondary): invalid fps value {fps_ctx}, using fallback 30")
                     fps = 30
 
         # Locate dataframes from context (accept multiple common keys).
@@ -1561,6 +1595,11 @@ def run_from_context(ctx: dict):
                     if Path(img_dir).exists():
                         overlay_com_video(img_dir, wide2, com2d, v_tmp, unit_tmp, overlay_path, fps, 'mp4v', ignore_joints=None)
                         out['overlay_mp4'] = str(overlay_path)
+                        # Add fps_info for frontend
+                        out['fps_info'] = {
+                            'original_fps': fps,
+                            'output_fps': min(fps, 60)  # Same logic as images_to_mp4
+                        }
                     else:
                         out.setdefault('overlay_error', f'img_dir not found: {img_dir}')
                 except Exception as e:
@@ -1648,6 +1687,7 @@ def run_from_context(ctx: dict):
                     'job_id': job_id,
                     'dimension': '3d' if use_3d else '2d',
                     'overlay_mp4': out.get('overlay_mp4'),
+                    'fps_info': out.get('fps_info'),  # Include fps information for frontend
                     'metrics': {
                         'com_speed': {
                             'summary': {

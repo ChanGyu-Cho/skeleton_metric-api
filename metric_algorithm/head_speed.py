@@ -894,7 +894,14 @@ def run_from_context(ctx: dict):
     try:
         dest = Path(ctx.get('dest_dir', '.'))
         job_id = str(ctx.get('job_id', ctx.get('job', 'job')))
-        fps = int(ctx.get('fps', 30))
+        # CRITICAL: Get fps from context; do NOT default to 30
+        # fps must be provided by controller based on video/intrinsics metadata
+        fps_ctx = ctx.get('fps')
+        if fps_ctx is None:
+            print(f"[WARN] head_speed: fps not provided in context, using fallback 30")
+            fps = 30
+        else:
+            fps = int(fps_ctx)
         wide3 = ctx.get('wide3')
         wide2 = ctx.get('wide2')
         # If wide2 is missing (no 2D CSV), but wide3 exists (3D run), use wide3 as a fallback

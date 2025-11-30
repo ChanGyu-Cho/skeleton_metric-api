@@ -41,6 +41,12 @@ except Exception:
 
 from openpose.skeleton_interpolate import interpolate_sequence
 from openpose.openpose import run_openpose_on_video, run_openpose_on_dir, _sanitize_person_list
+from metric_algorithm.smoothing import (
+    calculate_z_bounds, validate_z_value,
+    filter_z_outliers_by_frame_delta,
+    filter_z_outliers_by_frame_consistency
+)
+
 
 
 # ============================================================================
@@ -343,6 +349,9 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
         dest_dir = Path(dest_dir)
         dest_dir.mkdir(parents=True, exist_ok=True)
 
+        # Initialize fps variable for metrics pipeline (will be set from intrinsics if available)
+        fps = None
+
         # 입력 버킷을 환경변수에서 결정합니다.
         bucket = os.environ.get('S3_VIDEO_BUCKET_NAME') or os.environ.get('S3_BUCKET') or os.environ.get('AWS_S3_BUCKET')
         if not bucket:
@@ -374,8 +383,14 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
             cap = cv2.VideoCapture(str(local_video))
             frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            # Extract fps from video metadata for metrics pipeline
+            fps_float = cap.get(cv2.CAP_PROP_FPS)
+            fps = int(fps_float) if fps_float > 0 else None
             cap.release()
             print(f"[INFO] Video dimensions: {frame_width}x{frame_height}")
+            print(f"[DEBUG] 2D path: fps_float={fps_float}, fps={fps}")
+            if fps:
+                print(f"[INFO] Extracted fps={fps} from 2D video")
 
             crop_strategy = os.environ.get('OPENPOSE_CROP_STRATEGY', 'yolo').lower().strip()
             if crop_strategy not in ('none', 'yolo', 'two_pass_keypoints'):
@@ -673,8 +688,9 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
             # Apply Butterworth smoothing to 2D coordinates
             try:
                 from metric_algorithm.smoothing import smooth_skeleton_wide
-                # Apply low-pass filter with cutoff 0.1, order=2, fps=30
-                df_2d_wide_smooth = smooth_skeleton_wide(df_2d_wide, order=2, cutoff=0.1, fps=30.0, dimension='2d')
+                # Apply low-pass filter with cutoff 0.1, order=2, fps from video metadata
+                smoothing_fps = fps if fps is not None else 30.0
+                df_2d_wide_smooth = smooth_skeleton_wide(df_2d_wide, order=2, cutoff=0.1, fps=smoothing_fps, dimension='2d')
                 df_2d_wide = df_2d_wide_smooth
                 print("[INFO] Applied Butterworth smoothing to 2D skeleton")
             except Exception as e:
@@ -862,18 +878,30 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
                     # - 샘플 통계가 크면 mm→m(0.001)로 가정
                     depth_scale_factor = 1.0
                     inferred_unit = 'meters'
+                    fps = None  # Extract fps from intrinsics meta for metrics pipeline
                     try:
                         if 'intr_full' in locals() and isinstance(intr_full, dict):
                             meta = intr_full.get('meta') or intr_full.get('meta_data') or {}
-                            if isinstance(meta, dict) and 'depth_scale' in meta:
-                                # intr_full may have depth_scale if raw depth was saved; prefer it
-                                try:
-                                    ds = float(meta.get('depth_scale'))
-                                    if ds != 0 and ds != 1.0:
-                                        depth_scale_factor = ds
-                                        inferred_unit = f'raw_scale_{ds}'
-                                except Exception:
-                                    pass
+                            if isinstance(meta, dict):
+                                # Extract depth_scale if present
+                                if 'depth_scale' in meta:
+                                    # intr_full may have depth_scale if raw depth was saved; prefer it
+                                    try:
+                                        ds = float(meta.get('depth_scale'))
+                                        if ds != 0 and ds != 1.0:
+                                            depth_scale_factor = ds
+                                            inferred_unit = f'raw_scale_{ds}'
+                                    except Exception:
+                                        pass
+                                # Extract fps if present (used by metrics modules for overlay MP4 generation)
+                                if 'fps' in meta:
+                                    try:
+                                        fps = int(meta.get('fps'))
+                                        print(f"[INFO] Extracted fps={fps} from intrinsics.json meta")
+                                        print(f"[DEBUG] 3D path: fps from intrinsics.json meta = {fps}")
+                                    except Exception as e:
+                                        print(f"[WARN] Failed to parse fps from meta: {e}")
+                                        print(f"[DEBUG] 3D path: Exception parsing fps - {e}")
                         # fallback heuristic based on sample stats
                         if depth_scale_factor == 1.0:
                             for s in depth_validation:
@@ -963,6 +991,8 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
                 depth_files = sorted([p for p in depth_dir.iterdir() if p.suffix == '.npy'])
                 depth_count = len(depth_files)
                 depth_map_info = {'depth_count': depth_count}
+
+
 
                 # Try to locate intrinsics in common locations and accept multiple key names
                 intr = None
@@ -1067,8 +1097,14 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
                                     sample_info['patch_shape'] = patch.shape
                                     vals = patch[np.isfinite(patch) & (patch > 0)]
                                     sample_info['vals_count'] = int(vals.size)
-                                    Z = float(np.median(vals)) if vals.size else np.nan
+                                    Z_raw = float(np.median(vals)) if vals.size else np.nan
+                                    # CRITICAL FIX: Apply depth_scale_factor to convert raw depth to metric units
+                                    # raw depth (mm) × depth_scale (0.001) → depth in meters
+                                    Z = Z_raw * depth_scale_factor if (not np.isnan(Z_raw) and depth_scale_factor != 1.0) else Z_raw
                                     sample_info['Z_median'] = None if (np.isnan(Z) or not np.isfinite(Z)) else float(Z)
+                                    
+                                    # 1단계 필터링: 홀/0값 검사만 수행
+                                    # (범위 필터링은 나중에 동적 bounds로 수행)
                                     if sample_info['Z_median'] is not None:
                                         Zm = float(sample_info['Z_median'])
                                         # coerce intrinsics into floats and guarded access
@@ -1086,6 +1122,8 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
                                 except Exception:
                                     # if anything goes wrong sampling, keep NaNs and record minimal info
                                     pass
+
+
                             # append tidy row
                             rows.append({
                                 'frame': frame_idx,
@@ -1116,6 +1154,32 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
                     pass
 
                 df_3d = pd.DataFrame(rows)
+                
+                # 3D 필터링 적용 (metric 계산 전) - 프레임 간 연속성 + 프레임 내 일관성
+                if not df_3d.empty and 'Z' in df_3d.columns:
+                    try:
+                        # 2단계: 프레임 간 Z 연속성 필터링
+                        filter_depth_scale = depth_scale_factor if depth_scale_factor != 1.0 else 0.001
+                        df_3d = filter_z_outliers_by_frame_delta(df_3d, joint_threshold=0.4, depth_scale=filter_depth_scale)
+                        print("[INFO] Applied frame-delta Z filtering")
+                    except Exception as e:
+                        print(f"[WARN] Frame delta filtering failed: {e}")
+                    
+                    try:
+                        # 3단계: 프레임 내 Z 일관성 필터링
+                        filter_depth_scale = depth_scale_factor if depth_scale_factor != 1.0 else 0.001
+                        df_3d = filter_z_outliers_by_frame_consistency(
+                            df_3d,
+                            body_part_groups={
+                                'core': [11, 12],  # LShoulder, RShoulder (COCO-17)
+                                'upper_limbs': [5, 6, 7, 8]
+                            },
+                            consistency_threshold=0.6,
+                            depth_scale=filter_depth_scale
+                        )
+                        print("[INFO] Applied frame-consistency Z filtering")
+                    except Exception as e:
+                        print(f"[WARN] Frame consistency filtering failed: {e}")
 
                 # Build a 2D tidy DataFrame (frame, person_idx, joint_idx, x, y, conf)
                 # using the parsed OpenPose JSON (result_by_frame) so overlay uses pure 2D pixel coords.
@@ -1137,18 +1201,18 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
                     wide2 = pd.DataFrame()
 
                 try:
-                    # df_3d already contains rows with X,Y,Z columns - convert to wide using tidy_to_wide
-                    # The tidy rows used for df_3d are in variable 'rows' above
-                    df3_tidy = pd.DataFrame(rows)
-                    wide3 = tidy_to_wide(df3_tidy, dimension='3d', person_idx=0) if (not df3_tidy.empty) else pd.DataFrame()
+                    # df_3d already contains rows with X,Y,Z columns (and has been filtered)
+                    # Use the filtered df_3d directly to convert to wide format
+                    wide3 = tidy_to_wide(df_3d, dimension='3d', person_idx=0) if (not df_3d.empty) else pd.DataFrame()
                     
                     # Apply Butterworth smoothing to 3D coordinates
                     if isinstance(wide3, pd.DataFrame) and not wide3.empty:
                         try:
                             from metric_algorithm.smoothing import smooth_skeleton_wide
                             # Apply low-pass filter with cutoff 0.1 (Nyquist frequency)
-                            # order=2 (Butterworth 2nd order), fps=30
-                            wide3_smooth = smooth_skeleton_wide(wide3, order=2, cutoff=0.1, fps=30.0, dimension='3d')
+                            # order=2 (Butterworth 2nd order), fps from intrinsics metadata
+                            smoothing_fps = fps if fps is not None else 30.0
+                            wide3_smooth = smooth_skeleton_wide(wide3, order=2, cutoff=0.1, fps=smoothing_fps, dimension='3d')
                             wide3 = wide3_smooth
                             print("[INFO] Applied Butterworth smoothing to 3D skeleton")
                         except Exception as e:
@@ -1159,6 +1223,7 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
 
                 # CRITICAL: Save 3D skeleton CSV (matching 2D skeleton2d.csv format)
                 # Save skeleton3d.csv with wide3 format (frame-by-frame, COCO joints with X/Y/Z coordinates)
+                # 주의: 필터링은 이미 df_3d 생성 직후에 적용됨 (metric 계산 전)
                 try:
                     csv_dir = Path(dest_dir) / 'csv'
                     csv_dir.mkdir(parents=True, exist_ok=True)
@@ -1281,7 +1346,8 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
                         try:
                             from metric_algorithm.runner_utils import images_to_mp4
                             out_mp4 = Path(dest_dir) / f"{job_id}_overlay.mp4"
-                            created, used = images_to_mp4(imgs, out_mp4, fps=30.0, resize=None, filter_rendered=True, write_debug=True)
+                            overlay_fps = fps if fps is not None else 30.0
+                            created, used = images_to_mp4(imgs, out_mp4, fps=overlay_fps, resize=None, filter_rendered=True, write_debug=True)
                             if created:
                                 try:
                                     (Path(dest_dir) / 'overlay_debug.json').write_text(json.dumps({'overlay_source': src_desc, 'images_used': used}), encoding='utf-8')
@@ -1418,6 +1484,12 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
         # Optionally run local metrics using the in-memory DataFrames; run_metrics_in_process will write CSVs into dest_dir
         metrics_res = None
         try:
+            # Debug: Print fps value before passing to metrics
+            print(f"[DEBUG] fps before run_metrics_in_process: {fps}")
+            print(f"[DEBUG] locals has 'fps' key: {'fps' in locals()}")
+            print(f"[DEBUG] locals keys: {list(locals().keys())}")
+            if 'fps' in locals():
+                print(f"[DEBUG] locals['fps'] = {locals()['fps']}")
             metrics_res = run_metrics_in_process(dimension, locals())
         except Exception:
             # metrics failures shouldn't take down processing
@@ -1824,7 +1896,8 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
                     try:
                         from metric_algorithm.runner_utils import images_to_mp4
                         out_mp4 = Path(dest_dir) / f"{job_id}_overlay.mp4"
-                        created, used = images_to_mp4(imgs, out_mp4, fps=30.0, resize=None, filter_rendered=True, write_debug=True)
+                        overlay_fps = fps if fps is not None else 30.0
+                        created, used = images_to_mp4(imgs, out_mp4, fps=overlay_fps, resize=None, filter_rendered=True, write_debug=True)
                         if created:
                             try:
                                 (Path(dest_dir) / 'overlay_debug.json').write_text(json.dumps({'overlay_source': src_desc, 'images_used': used}), encoding='utf-8')

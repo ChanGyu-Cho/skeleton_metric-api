@@ -61,7 +61,7 @@ def _interpolate_series(s: pd.Series) -> pd.Series:
     s2 = s.copy()
     s2 = s2.astype(float)
     s2 = s2.interpolate(method='linear', limit_direction='both')
-    s2 = s2.fillna(method='ffill').fillna(method='bfill')
+    s2 = s2.ffill().bfill()
     return s2
 
 
@@ -98,7 +98,7 @@ def _ema(arr: np.ndarray, alpha: float) -> np.ndarray:
             continue
         prev = v if prev is None else (alpha * v + (1 - alpha) * prev)
         y[i] = prev
-    return pd.Series(y).fillna(method='ffill').fillna(method='bfill').to_numpy()
+    return pd.Series(y).ffill().bfill().to_numpy()
 
 def _moving(arr: np.ndarray, window: int) -> np.ndarray:
     if window <= 1:
@@ -164,7 +164,7 @@ def _one_euro(arr: np.ndarray, fps: int, min_cutoff: float, beta: float, d_cutof
         x_f = x if prev_x is None else (a * x + (1 - a) * prev_x)
         prev_x, prev_dx = x_f, dx_hat
         xhat.append(x_f)
-    return pd.Series(xhat).fillna(method='ffill').fillna(method='bfill').to_numpy()
+    return pd.Series(xhat).ffill().bfill().to_numpy()
 
 def smooth_df_2d(
     df: pd.DataFrame,
@@ -226,7 +226,7 @@ def speed_3d(points_xyz: np.ndarray, fps):
         unit = "mm/s"
     else:
         unit = "mm/frame"
-    v = pd.Series(v).fillna(method="ffill").fillna(0).to_numpy()
+    v = pd.Series(v).ffill().fillna(0).to_numpy()
     return v, unit
 
 def vectorized_speed_m_s_3d(points_xyz: np.ndarray, fps: int, scale_to_m: float = 1.0) -> np.ndarray:
@@ -242,7 +242,7 @@ def vectorized_speed_m_s_3d(points_xyz: np.ndarray, fps: int, scale_to_m: float 
     X = points_xyz.astype(float).copy()
     for c in range(3):
         s = pd.Series(X[:, c])
-        s = s.interpolate(limit_direction='both').fillna(method='ffill').fillna(method='bfill')
+        s = s.interpolate(limit_direction='both').ffill().bfill()
         X[:, c] = s.to_numpy()
     dx = np.diff(X[:, 0], prepend=X[0, 0])
     dy = np.diff(X[:, 1], prepend=X[0, 1])
@@ -307,7 +307,7 @@ def speed_2d(points_xy: np.ndarray, fps: Optional[int]):
     if fps and fps > 0:
         v = v * float(fps)
         unit = "px/s"
-    v = pd.Series(v).fillna(method="ffill").fillna(0).to_numpy()
+    v = pd.Series(v).ffill().fillna(0).to_numpy()
     return v, unit
 
 
@@ -347,9 +347,24 @@ def run_from_context(ctx: dict):
                     imgs = sorted([p for p in op_dir.iterdir() if p.suffix.lower() in ('.jpg', '.jpeg', '.png')])
             if imgs:
                 out_mp4 = Path(dest) / f"{job_id}_{metric}_overlay.mp4"
-                created, used = images_to_mp4(imgs, out_mp4, fps=float(ctx.get('fps', 30)), resize=None, filter_rendered=True, write_debug=True)
+                # CRITICAL: Get fps from context; do NOT default to 30
+                # fps must be provided by controller based on video/intrinsics metadata
+                fps_ctx = ctx.get('fps')
+                if fps_ctx is None:
+                    print(f"[WARN] swing_speed: fps not provided in context, using fallback 30")
+                    fps_value = 30
+                else:
+                    fps_value = fps_ctx
+                print(f"[DEBUG] swing_speed: ctx.get('fps') = {fps_ctx}")
+                print(f"[DEBUG] swing_speed: float(fps_value) = {float(fps_value)}")
+                created, used, original_fps, output_fps = images_to_mp4(imgs, out_mp4, fps=float(fps_value), resize=None, filter_rendered=True, write_debug=True)
                 if created:
                     out['overlay_mp4'] = str(out_mp4)
+                    # Store fps information for frontend
+                    out['fps_info'] = {
+                        'original_fps': original_fps,
+                        'output_fps': output_fps
+                    }
                     try:
                         s3info = upload_overlay_to_s3(str(out_mp4), job_id, metric)
                         if s3info:
@@ -370,7 +385,7 @@ def _pair_distance_px_series_2d(df: pd.DataFrame, joint_a: str, joint_b: str) ->
     for arr in (A, B):
         for c in range(arr.shape[1]):
             s = pd.Series(arr[:, c])
-            s = s.interpolate(limit_direction='both').fillna(method='ffill').fillna(method='bfill')
+            s = s.interpolate(limit_direction='both').ffill().bfill()
             arr[:, c] = s.to_numpy()
     d = np.sqrt((A[:, 0] - B[:, 0])**2 + (A[:, 1] - B[:, 1])**2)
     return d
@@ -933,7 +948,12 @@ def run_from_context(ctx: dict):
     try:
         dest = Path(ctx.get('dest_dir', '.'))
         job_id = str(ctx.get('job_id', ctx.get('job', 'job')))
-        fps = int(ctx.get('fps', 30))
+        fps_ctx = ctx.get('fps')
+        if fps_ctx is None:
+            print(f"[WARN] swing_speed.run_from_context (secondary): fps not provided, using fallback 30")
+            fps = 30
+        else:
+            fps = int(fps_ctx)
         wide3 = ctx.get('wide3')
         wide2 = ctx.get('wide2')
         if wide2 is None and wide3 is not None:
