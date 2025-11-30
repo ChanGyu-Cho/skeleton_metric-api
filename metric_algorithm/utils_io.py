@@ -91,17 +91,10 @@ def tidy_to_wide(df_tidy, dimension: str = '2d', person_idx: int = 0):
                 xval = float(X) if X is not None else float('nan')
                 yval = float(Y) if Y is not None else float('nan')
                 zval = float(Z) if Z is not None else float('nan')
-                # canonical names
+                # canonical names only (no duplication)
                 row[f"{name}__x"] = xval
                 row[f"{name}__y"] = yval
                 row[f"{name}__z"] = zval
-                # variants used by different modules
-                row[f"{name}_X3D"] = xval
-                row[f"{name}_Y3D"] = yval
-                row[f"{name}_Z3D"] = zval
-                row[f"{name}_X"] = xval
-                row[f"{name}_Y"] = yval
-                row[f"{name}_Z"] = zval
         rows.append(row)
 
     wide = _pd.DataFrame(rows)

@@ -629,6 +629,14 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
             if not interp:
                 raise RuntimeError('Interpolated sequence empty')
             
+            # Apply Butterworth smoothing to remove jitter/noise from OpenPose
+            try:
+                from metric_algorithm.smoothing import remove_jitter
+                interp = remove_jitter(interp, threshold=50.0)
+                print("[INFO] Applied jitter removal to 2D keypoints")
+            except Exception as e:
+                print(f"[WARN] Jitter removal failed: {e}")
+            
             # CRITICAL: Transform cropped coordinates back to original frame space
             # Local preprocessing saves coordinates in original frame space, not cropped
             # This fixes the 2px difference between local.csv and skeleton2d.csv
@@ -661,6 +669,17 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
                 rows.append(flat)
             
             df_2d_wide = pd.DataFrame(rows, columns=cols[:n_joints*3])
+            
+            # Apply Butterworth smoothing to 2D coordinates
+            try:
+                from metric_algorithm.smoothing import smooth_skeleton_wide
+                # Apply low-pass filter with cutoff 0.1, order=2, fps=30
+                df_2d_wide_smooth = smooth_skeleton_wide(df_2d_wide, order=2, cutoff=0.1, fps=30.0, dimension='2d')
+                df_2d_wide = df_2d_wide_smooth
+                print("[INFO] Applied Butterworth smoothing to 2D skeleton")
+            except Exception as e:
+                print(f"[WARN] 2D smoothing failed: {e}")
+                traceback.print_exc()
             
             # CRITICAL: Save interpolated CSV (matching local training data format)
             csv_dir = Path(dest_dir) / 'csv'
@@ -1122,8 +1141,36 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
                     # The tidy rows used for df_3d are in variable 'rows' above
                     df3_tidy = pd.DataFrame(rows)
                     wide3 = tidy_to_wide(df3_tidy, dimension='3d', person_idx=0) if (not df3_tidy.empty) else pd.DataFrame()
+                    
+                    # Apply Butterworth smoothing to 3D coordinates
+                    if isinstance(wide3, pd.DataFrame) and not wide3.empty:
+                        try:
+                            from metric_algorithm.smoothing import smooth_skeleton_wide
+                            # Apply low-pass filter with cutoff 0.1 (Nyquist frequency)
+                            # order=2 (Butterworth 2nd order), fps=30
+                            wide3_smooth = smooth_skeleton_wide(wide3, order=2, cutoff=0.1, fps=30.0, dimension='3d')
+                            wide3 = wide3_smooth
+                            print("[INFO] Applied Butterworth smoothing to 3D skeleton")
+                        except Exception as e:
+                            print(f"[WARN] 3D smoothing failed: {e}")
+                            traceback.print_exc()
                 except Exception:
                     wide3 = pd.DataFrame()
+
+                # CRITICAL: Save 3D skeleton CSV (matching 2D skeleton2d.csv format)
+                # Save skeleton3d.csv with wide3 format (frame-by-frame, COCO joints with X/Y/Z coordinates)
+                try:
+                    csv_dir = Path(dest_dir) / 'csv'
+                    csv_dir.mkdir(parents=True, exist_ok=True)
+                    csv_3d_path = csv_dir / f'{job_id}_skeleton3d.csv'
+                    if isinstance(wide3, pd.DataFrame) and not wide3.empty:
+                        wide3.to_csv(csv_3d_path, index=False)
+                        print(f"[INFO] Saved 3D skeleton CSV: {csv_3d_path}")
+                    else:
+                        print(f"[WARN] wide3 DataFrame is empty or not valid, skipping skeleton3d.csv write")
+                except Exception as e:
+                    print(f"[ERROR] Failed to save skeleton3d.csv: {e}")
+                    traceback.print_exc()
 
                 # Persist original RGB frames into dest_dir/img BEFORE tmpdir is removed so operators
                 # and metric modules can access them. For 2D input we extract frames from the input MP4;
@@ -1704,7 +1751,7 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
                         ske_rows.append(newr)
 
                     ske_df = pd.DataFrame(ske_rows, columns=cols_canonical)
-                    ske_path = Path(dest_dir) / 'skeleton2d.csv'
+                    ske_path = Path(dest_dir) / f'{job_id}_skeleton2d.csv'
                     ske_df.to_csv(ske_path, index=False)
                     response_payload.setdefault('debug', {})['mmaction_input_csv'] = str(ske_path)
                     try:
@@ -2012,7 +2059,10 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
             # Verify/repair skeleton2d.csv in csv/ directory: ensure COCO _x/_y/_c columns exist
             try:
                 ske_dir = csv_dir
-                ske_csv = ske_dir / 'skeleton2d.csv'
+                # Try to find skeleton2d.csv with or without job_id prefix
+                ske_csv = ske_dir / f'{job_id}_skeleton2d.csv'
+                if not ske_csv.exists():
+                    ske_csv = ske_dir / 'skeleton2d.csv'
                 if ske_csv.exists():
                     try:
                         missing = mmaction_client._validate_csv_matches_coco(ske_csv)
@@ -2104,8 +2154,8 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
                             ske_csv_parent = ske_csv.parent if 'ske_csv' in locals() else ske_dir
                             ensure_dir = lambda p: p.mkdir(parents=True, exist_ok=True)
                             ensure_dir(ske_csv_parent)
-                            ske_df.to_csv(ske_csv_parent / 'skeleton2d.csv', index=False)
-                            response_payload.setdefault('debug', {})['mmaction_input_csv_written'] = str(ske_csv_parent / 'skeleton2d.csv')
+                            ske_df.to_csv(ske_csv_parent / f'{job_id}_skeleton2d.csv', index=False)
+                            response_payload.setdefault('debug', {})['mmaction_input_csv_written'] = str(ske_csv_parent / f'{job_id}_skeleton2d.csv')
             except Exception:
                 # non-fatal
                 pass
