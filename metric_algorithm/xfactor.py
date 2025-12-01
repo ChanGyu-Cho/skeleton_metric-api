@@ -204,12 +204,31 @@ def smooth_df_2d(
 단계별 알고리즘 보조 함수들 (3~11)
 """
 def ensure_direction_continuity(V: np.ndarray) -> np.ndarray:
+    """벡터 시퀀스의 방향 연속성 보장
+    
+    인접한 두 벡터 간 각도가 90도를 초과하면, 현재 벡터를 반대 방향으로 조정합니다.
+    이를 통해 스켈레톤 감지 오류로 인한 급격한 점프를 완화합니다.
+    """
     out = V.copy()
     for i in range(1, len(out)):
         a, b = out[i-1], out[i]
-        if not (np.any(np.isnan(a)) or np.any(np.isnan(b))):
-            if float(np.dot(b, a)) < 0:
+        if np.any(np.isnan(a)) or np.any(np.isnan(b)):
+            continue
+        
+        # 내적 계산 (cos 유사도)
+        dot_prod = float(np.dot(b, a))
+        norm_a = float(np.linalg.norm(a))
+        norm_b = float(np.linalg.norm(b))
+        
+        # 정규화를 안전하게
+        if norm_a > 1e-6 and norm_b > 1e-6:
+            cos_angle = dot_prod / (norm_a * norm_b)
+            cos_angle = np.clip(cos_angle, -1, 1)  # 수치 오류 방지
+            
+            # 각도 > 90도 (cos_angle < 0) 또는 > 70도 (cos_angle < 0.342)이면 반대 방향으로
+            if cos_angle < 0:
                 out[i] = -b
+    
     return out
 
 def angles_deg_for_plane(V: np.ndarray, axis_a: int, axis_b: int) -> np.ndarray:
@@ -236,6 +255,47 @@ def normalize_angle_to_180(angle: float) -> float:
     while angle < -180:
         angle += 360
     return angle
+
+def normalize_angle_to_180_closest(angle: float, reference: float = 0.0) -> float:
+    """각도를 [-180, 180] 범위로 정규화 (기준 각도에 가장 가깝게)
+    
+    Args:
+        angle: 정규화할 각도
+        reference: 참조 각도 (이 값에 가장 가깝게 유지)
+    
+    Returns:
+        [-180, 180] 범위의 정규화된 각도
+    """
+    # 먼저 [-180, 180] 범위로
+    angle = normalize_angle_to_180(angle)
+    
+    # 참조 각도와의 거리 계산 (두 표현 모두 고려)
+    dist1 = abs(angle - reference)
+    dist2 = abs((angle + 360) - reference) if angle < 0 else abs((angle - 360) - reference)
+    
+    # 더 가까운 표현 선택
+    if dist2 < dist1:
+        if angle < 0:
+            return angle + 360
+        else:
+            return angle - 360
+    return angle
+
+def shortest_angle_diff(angle1: float, angle2: float) -> float:
+    """두 각도 간 최소 거리 (signed)
+    
+    Returns:
+        [-180, 180] 범위의 최소 차이 (각도1 - 각도2)
+    """
+    diff = angle1 - angle2
+    
+    # 정규화
+    while diff > 180:
+        diff -= 360
+    while diff < -180:
+        diff += 360
+    
+    return diff
 
 def smooth_median_then_moving(x: np.ndarray, w: int = 5) -> np.ndarray:
     s = pd.Series(x)
@@ -277,16 +337,18 @@ def compute_xfactor(df: pd.DataFrame) -> Dict[str, any]:
     for name, ax_a, ax_b in planes:
         shoulder_angle = angles_deg_for_plane(shoulder_vec, ax_a, ax_b)
         pelvis_angle   = angles_deg_for_plane(pelvis_vec, ax_a, ax_b)
-        # X-Factor raw = 상체 각도 - 하체 각도 (부호 있음)
-        xf_raw = shoulder_angle - pelvis_angle
-        # [-180, 180] 범위 정규화 (여러 번 순환 처리)
-        xf_raw = np.array([normalize_angle_to_180(x) for x in xf_raw])
-        # 7) 스무딩 (여전히 부호 있는 값)
-        xf_smooth = smooth_median_then_moving(xf_raw, w=5)
-        # 8) 절댓값 변환
-        xf_smooth = np.abs(xf_smooth)
-        # 최종 안전장치: 음수 제거 및 [0, 180] 범위 강제
-        xf_smooth = np.clip(xf_smooth, 0, 180)
+        # X-Factor raw = 상체 각도 - 하체 각도 (최소 거리 원칙: 항상 -180~180 범위)
+        xf_raw = np.array([shortest_angle_diff(sh, pe) 
+                           for sh, pe in zip(shoulder_angle, pelvis_angle)])
+        # 7) 절댓값 변환 (X-Factor는 크기만 필요) - 스무딩 전에 수행하여 부호 변화 제거
+        xf_abs = np.abs(xf_raw)
+        # 7.5) 스무딩 (절댓값, 노이즈 제거)
+        xf_smooth = smooth_median_then_moving(xf_abs, w=5)
+        # 8) 범위 제한: [0, 100]
+        #    참고: 골프에서 X-Factor는 일반적으로 0-60도 범위 (최대 ~75도)
+        #    과거 151도 오류는 부호 변화로 인한 artifact (이제 수정됨)
+        #    100도까지 허용하여 극단적 자세도 캡처 가능
+        xf_smooth = np.clip(xf_smooth, 0, 100)
         xf_by_plane[name] = xf_smooth
 
     # 9) 임팩트 프레임 탐지

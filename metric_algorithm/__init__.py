@@ -158,6 +158,32 @@ def run_metrics_from_context(ctx: dict, dest_dir: str, job_id: str, dimension: s
 		'dimension': dimension,
 	}
 
+	# 🔧 AUTO-DETECT COORDINATE UNIT FOR 3D
+	# If dimension is 3d and wide3 exists, detect if coordinates are camera-normalized
+	# (very small: 0.0001~0.0005m) and set coord_unit accordingly
+	if dimension == '3d' and wide3 is not None and 'coord_unit' not in ctx:
+		try:
+			import numpy as _np_local
+			# Sample all numeric columns (assuming COCO-17 3D coordinates)
+			coord_cols = [c for c in wide3.columns if any(x in c.lower() for x in ('_x3d', '_y3d', '_z3d', '__x', '__y', '__z'))]
+			if coord_cols:
+				all_vals = []
+				for col in coord_cols:
+					all_vals.extend(wide3[col].dropna().abs().tolist())
+				if all_vals:
+					max_val = max(all_vals)
+					min_val = min([v for v in all_vals if v > 0])
+					coord_range = max_val - min_val
+					print(f"[DEBUG] 3D 좌표 범위 감지: min={min_val:.6f}, max={max_val:.6f}, range={coord_range:.6f}")
+					
+					# Heuristic: if all coordinates are in (0, 0.01) range → camera-normalized
+					if max_val < 0.01 and max_val > 0.0000001:
+						print(f"[INFO] 📏 카메라 정규화 좌표 감지 → coord_unit='m' (좌표는 이미 정규화됨)")
+						module_ctx['coord_unit'] = 'm'
+					# else: keep ctx default or not set (swing_speed will use 'm')
+		except Exception as e:
+			print(f"[WARN] 3D 좌표 범위 감지 실패: {e}")
+
 	# Forward a small set of commonly-used optional context keys from the
 	# original ctx so modules that expect fps/codec/draw/etc still work when
 	# controller supplied them. Use None when not present so modules can fall

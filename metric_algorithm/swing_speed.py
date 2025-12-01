@@ -212,30 +212,24 @@ def smooth_df_2d(
     print(f"🎛️ 2D 스무딩 적용: method={method}, window={window}, alpha={alpha}")
     return out
 
-def speed_3d(points_xyz: np.ndarray, fps):
-    """3D 속도 계산"""
-    N = len(points_xyz)
-    v = np.full(N, np.nan, dtype=float)
-    for i in range(1, N):
-        a, b = points_xyz[i-1], points_xyz[i]
-        if np.any(np.isnan(a)) or np.any(np.isnan(b)):
-            continue
-        v[i] = float(np.linalg.norm(b - a))
-    if fps and fps > 0:
-        v = v * float(fps)
-        unit = "mm/s"
-    else:
-        unit = "mm/frame"
-    v = pd.Series(v).ffill().fillna(0).to_numpy()
-    return v, unit
-
 def vectorized_speed_m_s_3d(points_xyz: np.ndarray, fps: int, scale_to_m: float = 1.0) -> np.ndarray:
     """
     벡터화된 손목 3D 속도(m/s) 계산
-      Δs = sqrt((Δx)^2 + (Δy)^2 + (Δz)^2)
-      Δt = 1 / fps
-      v = (Δs * scale_to_m) * fps
-    scale_to_m: 좌표 단위를 미터로 환산하는 스케일 (m 기준). 예) m:1.0, cm:0.01, mm:0.001
+    
+    공식: v = Δs / Δt [m/s]
+    - Δs = sqrt((Δx)^2 + (Δy)^2 + (Δz)^2) : 연속 프레임 간 유클리드 거리 (미터 단위)
+    - Δt = 1 / fps : 프레임 간격 (초)
+    - scale_to_m: 좌표 단위를 미터로 환산하는 스케일
+      * 카메라 정규화 좌표: 1.0 (0.0002~0.0005 범위, 이미 m 단위)
+      * mm 좌표: 0.001 (mm → m)
+      * cm 좌표: 0.01 (cm → m)
+    
+    정확한 계산 순서:
+    1. Δs = sqrt((Δx)^2 + (Δy)^2 + (Δz)^2) [좌표 원래 단위]
+    2. Δs_m = Δs * scale_to_m [m 단위로 변환]
+    3. v_m_s = Δs_m * fps [m/s]
+    
+    반환: v_m_s 배열 (첫 번째 프레임은 0.0)
     """
     if points_xyz.ndim != 2 or points_xyz.shape[1] != 3:
         return np.full((len(points_xyz),), np.nan, dtype=float)
@@ -248,17 +242,28 @@ def vectorized_speed_m_s_3d(points_xyz: np.ndarray, fps: int, scale_to_m: float 
     dy = np.diff(X[:, 1], prepend=X[0, 1])
     dz = np.diff(X[:, 2], prepend=X[0, 2])
     ds = np.sqrt(dx**2 + dy**2 + dz**2)
-    # 좌표 단위를 m로 환산
+    
+    # 1단계: 좌표 단위를 m로 환산
     ds_m = ds * float(scale_to_m)
-    v_m_s = ds_m * float(fps if fps and fps > 0 else 30)
+    
+    # 2단계: v = Δs_m * fps [m/s]
+    # (Δt = 1/fps이므로, Δs/Δt = Δs * fps)
+    fps_float = float(fps if fps and fps > 0 else 30)
+    v_m_s = ds_m * fps_float
+    
     if len(v_m_s) > 0:
         v_m_s[0] = 0.0
     return v_m_s
 
 def _speed_conversions_m_s(v_m_s: np.ndarray):
-    """m/s 배열을 km/h, mph로 동시 변환"""
+    """m/s 배열을 km/h, mph로 동시 변환
+    
+    공식:
+    - v_km_h = v_m_s * 3.6 [m/s * 3600/1000 = m/s * 3.6 → km/h]
+    - v_mph = v_m_s * 2.237 [m/s * 3600/1609.344 → mph]
+    """
     v_kmh = v_m_s * 3.6
-    v_mph = v_m_s * 2.23694
+    v_mph = v_m_s * 2.237  # 정확한 값: 3.6 / 1.609344
     return v_m_s, v_kmh, v_mph
 
 def detect_impact_by_crossing(wrist_x: np.ndarray, stance_mid_x: np.ndarray) -> int:
@@ -501,29 +506,53 @@ def _autocalibrate_m_per_px(df: pd.DataFrame, cfg: dict) -> Optional[float]:
 
 def analyze_wrist_speed_3d(df: pd.DataFrame, fps: int, wrist: str = "RWrist", scale_to_m: float = 1.0):
     """
-    입력: 3D CSV (mm), 필수: {wrist}_X3D/Y3D/Z3D, RAnkle_X3D, LAnkle_X3D
+    입력: 3D CSV (좌표 원래 단위), 필수: {wrist}_X3D/Y3D/Z3D, RAnkle_X3D, LAnkle_X3D
     출력:
       - impact_frame, peak_frame
-      - 시계열 속도 v_mm_s, v_m_s, v_km_h, v_mph
+      - 시계열 속도 v_m_s, v_km_h, v_mph (모두 m/s 기준으로 변환됨)
       - 피크 속도(손목) km/h, mph
       - 클럽 헤드 추정 속도(k=1.35) 및 범위(k=1.25~1.55)
+    
+    계산 프로세스:
+    1. 손목 3D 좌표(X, Y, Z) 추출
+    2. 프레임 간 거리 계산 Δs (좌표 원래 단위)
+    3. scale_to_m 적용하여 m 단위로 변환: Δs_m = Δs * scale_to_m
+    4. 속도 계산: v_m_s = Δs_m * fps [m/s]
+    5. 변환: v_km_h = v_m_s * 3.6, v_mph = v_m_s * 2.237
     """
-    W = get_xyz_cols(df, wrist)         # (N,3) mm
+    W = get_xyz_cols(df, wrist)         # (N,3) 좌표 원래 단위
     RA = get_xyz_cols(df, 'RAnkle')     # (N,3)
     LA = get_xyz_cols(df, 'LAnkle')     # (N,3)
+    
+    # 좌표 범위 로깅 (단위 확인용)
+    coord_range_min = np.nanmin(np.abs(W[~np.isnan(W)]))
+    coord_range_max = np.nanmax(np.abs(W[~np.isnan(W)]))
+    coord_range_min = np.nanmin(np.abs(W[~np.isnan(W)]))
+    coord_range_max = np.nanmax(np.abs(W[~np.isnan(W)]))
+    print(f"[DEBUG] analyze_wrist_speed_3d: 좌표 범위 [{coord_range_min:.9f}, {coord_range_max:.6f}], scale_to_m={scale_to_m:.6f}")
+    print(f"[DEBUG] scale_to_m={scale_to_m} → 예상 단위: {'mm' if scale_to_m==0.001 else 'cm' if scale_to_m==0.01 else 'm'}")
+    
     wx = W[:, 0]
     stance_mid_x = (RA[:, 0] + LA[:, 0]) / 2.0
-    # 3D 손목 속도 (m/s) - 좌표 단위를 scale_to_m를 통해 m로 환산
+    
+    # 3D 손목 속도 (m/s)
     v_m_s = vectorized_speed_m_s_3d(W, fps, scale_to_m=scale_to_m)
+    print(f"[DEBUG] v_m_s 샘플 (처음 10프레임): {v_m_s[:10]}")
     v_ms, v_kmh, v_mph = _speed_conversions_m_s(v_m_s)
+    
     # 임팩트 프레임 탐지
     impact = detect_impact_by_crossing(wx, stance_mid_x)
+    
     # ±2 프레임 내 피크 속도
     lo = max(0, impact - 2)
     hi = min(len(v_kmh) - 1, impact + 2)
     peak_local_idx = lo + int(np.nanargmax(v_kmh[lo:hi+1])) if hi >= lo else int(np.nanargmax(v_kmh))
     peak_wrist_kmh = float(v_kmh[peak_local_idx]) if not np.isnan(v_kmh[peak_local_idx]) else float(np.nanmax(v_kmh))
-    peak_wrist_mph = float(peak_wrist_kmh / 1.609344)
+    peak_wrist_mph = peak_wrist_kmh / 1.609344  # km/h → mph 정확한 변환
+    
+    print(f"[DEBUG] Peak frame={peak_local_idx}, v_m_s={v_m_s[peak_local_idx]:.6f}, "
+          f"v_km_h={peak_wrist_kmh:.2f}, v_mph={peak_wrist_mph:.2f}")
+    
     # 클럽 헤드 추정 (가중치)
     k = 1.35
     k_min, k_max = 1.25, 1.55
@@ -531,6 +560,7 @@ def analyze_wrist_speed_3d(df: pd.DataFrame, fps: int, wrist: str = "RWrist", sc
     club_mph = peak_wrist_mph * k
     club_kmh_min, club_kmh_max = peak_wrist_kmh * k_min, peak_wrist_kmh * k_max
     club_mph_min, club_mph_max = peak_wrist_mph * k_min, peak_wrist_mph * k_max
+    
     return {
         'impact_frame': int(impact),
         'peak_frame': int(peak_local_idx),
@@ -552,16 +582,20 @@ def analyze_wrist_speed_2d(df: pd.DataFrame, fps: int, wrist: str = "RWrist", m_
       - impact_frame, peak_frame
       - 시계열 속도 v_px_s
       - 피크 속도(손목) px/s
+      - m_per_px 스케일이 있으면 m/s, km/h, mph도 함께 제공
     """
     W = get_xy_cols_2d(df, wrist)        # (N,2) px
     RA = get_xy_cols_2d(df, 'RAnkle')     # (N,2) px (없으면 NaN)
     LA = get_xy_cols_2d(df, 'LAnkle')     # (N,2)
     wx = W[:, 0]
     stance_mid_x = (RA[:, 0] + LA[:, 0]) / 2.0
+    
     # 2D 손목 속도 (px/s)
     v_px_s, unit = speed_2d(W, fps)
+    
     # 임팩트 프레임 탐지 (2D)
     impact = detect_impact_by_crossing(wx, stance_mid_x)
+    
     # ±2 프레임 내 피크 속도
     lo = max(0, impact - 2)
     hi = min(len(v_px_s) - 1, impact + 2)
@@ -573,7 +607,8 @@ def analyze_wrist_speed_2d(df: pd.DataFrame, fps: int, wrist: str = "RWrist", m_
         v_m_s = v_px_s * float(m_per_px)
         v_ms, v_kmh, v_mph = _speed_conversions_m_s(v_m_s)
         peak_wrist_kmh = float(v_kmh[peak_local_idx]) if not np.isnan(v_kmh[peak_local_idx]) else float(np.nanmax(v_kmh))
-        peak_wrist_mph = float(peak_wrist_kmh / 1.609344)
+        peak_wrist_mph = peak_wrist_kmh / 1.609344  # km/h → mph 정확한 변환
+        
         # 클럽 추정 가중치 동일 적용
         k = 1.35
         k_min, k_max = 1.25, 1.55
@@ -581,6 +616,7 @@ def analyze_wrist_speed_2d(df: pd.DataFrame, fps: int, wrist: str = "RWrist", m_
         club_mph = peak_wrist_mph * k
         club_kmh_min, club_kmh_max = peak_wrist_kmh * k_min, peak_wrist_kmh * k_max
         club_mph_min, club_mph_max = peak_wrist_mph * k_min, peak_wrist_mph * k_max
+        
         return {
             'impact_frame': int(impact),
             'peak_frame': int(peak_local_idx),
@@ -598,6 +634,7 @@ def analyze_wrist_speed_2d(df: pd.DataFrame, fps: int, wrist: str = "RWrist", m_
             'unit': 'px/s',
             'calibrated_m_per_px': float(m_per_px),
         }
+    
     # 보정 불가 시 기존(px/s)만 반환
     return {
         'impact_frame': int(impact),
@@ -633,40 +670,91 @@ def load_cfg(p: Path):
     raise ValueError("Use YAML for analyze config.")
 
 def _coord_scale_to_m(cfg: dict) -> float:
-    """analyze.yaml에서 coord_unit을 읽어 미터 환산 스케일을 반환합니다.
-    - 지원 단위: m, cm, mm (대소문자 무시)
-    - 기본값: m (1.0)
+    """분석 설정에서 좌표 단위 → 미터 환산 스케일을 결정합니다.
+    
+    우선순위:
+    1. intrinsics.json의 depth_scale (있으면 우선 사용)
+    2. analyze.yaml의 coord_unit 명시 설정
+    3. wide3 데이터로부터 자동 감지 (좌표 범위 기반)
+    4. 기본값: 1.0 (m로 간주)
+    
+    지원 단위: m, cm, mm (대소문자 무시)
     """
+    # 1단계: intrinsics.json에서 depth_scale 확인 (3D ZIP으로 전달된 메타정보)
+    if 'intrinsics' in cfg and isinstance(cfg['intrinsics'], dict):
+        meta = cfg['intrinsics'].get('meta', {})
+        if isinstance(meta, dict):
+            depth_scale = meta.get('depth_scale')
+            if depth_scale is not None:
+                try:
+                    scale = float(depth_scale)
+                    if scale > 0:
+                        print(f"[INFO] intrinsics.json depth_scale 사용: {scale:.6f} (m/unit)")
+                        return scale
+                except (TypeError, ValueError):
+                    pass
+    
+    # 2단계: analyze.yaml의 coord_unit 명시 설정
     unit = (cfg.get("coord_unit", "m") or "m").strip().lower()
+    
     if unit in ("m", "meter", "metre", "meters"):
+        print(f"[INFO] coord_unit='m' 사용 → scale_to_m=1.0")
         return 1.0
     if unit in ("cm", "centimeter", "centimetre", "centimeters"):
+        print(f"[INFO] coord_unit='cm' 사용 → scale_to_m=0.01")
         return 1e-2
     if unit in ("mm", "millimeter", "millimetre", "millimeters"):
+        print(f"[INFO] coord_unit='mm' 사용 → scale_to_m=0.001")
         return 1e-3
-    # 알 수 없는 단위면 보수적으로 1.0 (m) 처리
-    print(f"⚠️ 알 수 없는 coord_unit='{unit}', m로 간주합니다.")
+    
+    # 3단계: wide3 데이터로부터 자동 감지 (좌표 범위 기반)
+    try:
+        wide3 = cfg.get("wide3")
+        if wide3 is not None and hasattr(wide3, 'columns'):
+            # 3D 컬럼 찾기 (대소문자 무시, X3D/Y3D/Z3D 또는 _X/_Y/_Z 패턴)
+            coord_cols = [c for c in wide3.columns if any(
+                x.lower() in c.lower() for x in ('x3d', 'y3d', 'z3d', '_x', '_y', '_z')
+            ) and (c.lower().endswith(('x3d', 'y3d', 'z3d', '_x', '_y', '_z')))]
+            
+            if coord_cols:
+                all_vals = []
+                for col in coord_cols:
+                    try:
+                        col_data = wide3[col].dropna()
+                        if len(col_data) > 0:
+                            all_vals.extend(col_data.abs().tolist())
+                    except Exception:
+                        pass
+                
+                if all_vals:
+                    max_val = float(max(all_vals))
+                    min_val = float(min([v for v in all_vals if v > 0]))
+                    print(f"[DEBUG] 자동 감지: 3D 좌표 범위 = [{min_val:.9f}, {max_val:.6f}]")
+                    
+                    # Heuristic으로 단위 판정
+                    # 1) 카메라 정규화: 0.0001 ~ 0.001 범위
+                    # 2) mm 단위: 0.01 ~ 100 범위 (10~1000 mm)
+                    # 3) m 단위: 0.1 ~ 10 범위
+                    
+                    if min_val >= 0.0001 and max_val < 0.01:
+                        print(f"[INFO] 🎯 카메라 정규화 좌표 감지 → scale_to_m=1.0 (이미 m 단위)")
+                        return 1.0
+                    elif min_val >= 0.01 and max_val <= 1000:
+                        print(f"[INFO] 🎯 mm 범위 좌표 감지 → scale_to_m=0.001 (mm→m 변환)")
+                        return 1e-3
+                    elif min_val >= 1 and max_val <= 10:
+                        print(f"[INFO] 🎯 m 범위 좌표 감지 → scale_to_m=1.0 (이미 m 단위)")
+                        return 1.0
+    except Exception as e:
+        print(f"[WARN] 자동 감지 실패: {e}")
+    
+    # 최종 기본값
+    print(f"[WARN] 좌표 단위를 확정할 수 없음, m로 간주합니다 (scale_to_m=1.0)")
     return 1.0
 
 # =========================================================
 # Swing Speed 전용 계산 함수
 # =========================================================
-def compute_grip_points_3d(df: pd.DataFrame, wrist_r: str, wrist_l: str):
-    """
-    프레임별 3D Grip(mm) 좌표 = 두 손목 중점
-    """
-    print(f"🎯 Swing Speed 계산용 관절: [{wrist_l}, {wrist_r}]")
-    
-    R = get_xyz_cols(df, wrist_r)
-    L = get_xyz_cols(df, wrist_l)
-    grip_points = (R + L) / 2.0
-    
-    # 개별 손목 속도도 계산
-    R_speed, _ = speed_3d(R, None)
-    L_speed, _ = speed_3d(L, None)
-    
-    return grip_points, R, L, R_speed, L_speed
-
 def get_swing_joints_2d(df: pd.DataFrame, wrist_r: str, wrist_l: str):
     """스윙에 관련된 관절들의 2D 좌표 확인"""
     swing_joints = [wrist_l, wrist_r]
@@ -982,7 +1070,25 @@ def run_from_context(ctx: dict):
             try:
                 if dimension == '3d':
                     # 3D 분석
-                    scale_to_m = _coord_scale_to_m(ctx)
+                    # wide3과 intrinsics를 ctx에 추가하여 _coord_scale_to_m에서 활용 가능하게
+                    ctx_for_scale = dict(ctx)
+                    ctx_for_scale['wide3'] = use_df
+                    
+                    # intrinsics 정보 전달 (depth_scale 등 메타데이터 포함)
+                    print(f"[DEBUG] run_from_context: 'intrinsics' in ctx = {'intrinsics' in ctx}")
+                    if 'intrinsics' in ctx:
+                        print(f"[DEBUG] intrinsics type = {type(ctx['intrinsics'])}")
+                        print(f"[DEBUG] intrinsics keys = {list(ctx['intrinsics'].keys()) if isinstance(ctx['intrinsics'], dict) else 'N/A'}")
+                    
+                    if 'intrinsics' in ctx and isinstance(ctx['intrinsics'], dict):
+                        ctx_for_scale['intrinsics'] = ctx['intrinsics']
+                        print(f"[DEBUG] intrinsics 추가됨: {ctx['intrinsics'].get('meta', {}).get('depth_scale', 'NOT FOUND')}")
+                    else:
+                        print(f"[DEBUG] intrinsics 미포함 또는 dict 아님")
+                    
+                    scale_to_m = _coord_scale_to_m(ctx_for_scale)
+                    print(f"[DEBUG] scale_to_m 결정됨: {scale_to_m}")
+                    
                     anal = analyze_wrist_speed_3d(use_df, fps=fps, wrist=wrist_r, scale_to_m=scale_to_m)
                     # 메트릭 CSV 구성 (프레임별 m/s, km/h, mph)
                     N = len(anal['v_m_s'])

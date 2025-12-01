@@ -1487,10 +1487,27 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
             # Debug: Print fps value before passing to metrics
             print(f"[DEBUG] fps before run_metrics_in_process: {fps}")
             print(f"[DEBUG] locals has 'fps' key: {'fps' in locals()}")
-            print(f"[DEBUG] locals keys: {list(locals().keys())}")
             if 'fps' in locals():
                 print(f"[DEBUG] locals['fps'] = {locals()['fps']}")
-            metrics_res = run_metrics_in_process(dimension, locals())
+            
+            # Prepare context for metrics modules
+            # IMPORTANT: Include intrinsics (depth_scale, etc) for swing_speed scale conversion
+            ctx_for_metrics = locals().copy()
+            print(f"[DEBUG] 'intr_full' in locals: {'intr_full' in locals()}")
+            if 'intr_full' in locals():
+                print(f"[DEBUG] intr_full type: {type(intr_full)}")
+                if isinstance(intr_full, dict):
+                    print(f"[DEBUG] intr_full keys: {list(intr_full.keys())}")
+                    print(f"[DEBUG] intr_full['meta']: {intr_full.get('meta', 'NOT FOUND')}")
+            
+            if 'intr_full' in locals() and isinstance(intr_full, dict):
+                ctx_for_metrics['intrinsics'] = intr_full
+                print(f"[DEBUG] ✓ Added intrinsics to ctx_for_metrics: {list(intr_full.keys())}")
+                print(f"[DEBUG] ✓ intrinsics.meta.depth_scale = {intr_full.get('meta', {}).get('depth_scale', 'NOT FOUND')}")
+            else:
+                print(f"[DEBUG] ✗ intrinsics NOT added (intr_full missing or not dict)")
+            
+            metrics_res = run_metrics_in_process(dimension, ctx_for_metrics)
         except Exception:
             # metrics failures shouldn't take down processing
             traceback.print_exc()

@@ -1026,6 +1026,11 @@ def run_from_context(ctx: dict):
                                        head_deviations if 'head_deviations' in locals() else np.zeros(len(df_overlay_sm)),
                                        stability_metrics if 'stability_metrics' in locals() else {}, head_unit if 'head_unit' in locals() else 'mm/frame', 'Nose', overlay_path, fps, codec)
                     out['overlay_mp4'] = str(overlay_path)
+                    # Add fps_info for frontend
+                    out['fps_info'] = {
+                        'original_fps': fps,
+                        'output_fps': min(fps, 60)
+                    }
                 except Exception as e:
                     out.setdefault('overlay_error', str(e))
 

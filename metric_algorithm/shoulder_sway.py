@@ -394,7 +394,13 @@ def run_from_context(ctx: dict):
                 lm = ctx.get('landmarks', {}) or {}
                 # Create both job-specific overlay and canonical analysis name for compatibility
                 overlay_sway(img_dir, wide2, overlay_path, fps, 'mp4v', lm)
-                return {'overlay_mp4': str(overlay_path)}
+                return {
+                    'overlay_mp4': str(overlay_path),
+                    'fps_info': {
+                        'original_fps': fps,
+                        'output_fps': min(fps, 60)
+                    }
+                }
             except Exception:
                 # fall through to trying to find existing rendered files
                 pass
@@ -413,7 +419,13 @@ def run_from_context(ctx: dict):
         if candidates:
             candidates = sorted(candidates, key=lambda p: (0 if p.name.startswith(job_id) else 1, p.name))
             chosen = candidates[0]
-            return {'overlay_mp4': str(chosen)}
+            return {
+                'overlay_mp4': str(chosen),
+                'fps_info': {
+                    'original_fps': fps,
+                    'output_fps': min(fps, 60)
+                }
+            }
 
         return {'overlay_mp4': None}
 
