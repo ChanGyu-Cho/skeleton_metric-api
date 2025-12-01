@@ -16,6 +16,7 @@ def butterworth_filter(data: np.ndarray, order: int = 2, cutoff: float = 0.1,
     Butterworth 저역 필터 적용
     
     중요: NaN 값은 보존됨 (필터링 후 재복원)
+    전체 배열에 필터 적용하여 엣지 효과 제거
     
     Parameters
     ----------
@@ -46,20 +47,26 @@ def butterworth_filter(data: np.ndarray, order: int = 2, cutoff: float = 0.1,
         # butter SOS 필터 설계
         sos = butter(order, cutoff, output='sos')
         
-        # 필터 적용 (NaN 무시)
+        # 선형 보간으로 NaN 값 임시로 채우기
         x = data.copy()
+        indices = np.arange(len(x))
         valid_indices = np.where(mask)[0]
         
-        if len(valid_indices) > 0:
-            # 보간하여 필터 적용
-            valid_data = x[valid_indices]
-            filtered = sosfilt(sos, valid_data)
-            x[valid_indices] = filtered
-            
-            # **중요**: 필터링 후 원본 NaN 위치 복원
-            x[~mask] = np.nan
+        if len(valid_indices) > 0 and len(valid_indices) < len(x):
+            # 선형 보간으로 NaN 채우기
+            x_interp = np.interp(indices, valid_indices, x[valid_indices])
+        elif len(valid_indices) == 0:
+            return data  # 모두 NaN이면 그대로 반환
+        else:
+            x_interp = x.copy()  # NaN이 없으면 그대로
         
-        return x
+        # 전체 배열에 필터 적용 (엣지 효과 제거를 위해)
+        filtered = sosfilt(sos, x_interp)
+        
+        # 필터링된 데이터의 유효한 부분만 사용
+        filtered[~mask] = np.nan
+        
+        return filtered
     
     # 2D 데이터 처리 (프레임 x 특성)
     elif data.ndim == 2:
@@ -72,15 +79,23 @@ def butterworth_filter(data: np.ndarray, order: int = 2, cutoff: float = 0.1,
                 continue
             
             sos = butter(order, cutoff, output='sos')
+            indices = np.arange(len(col))
             valid_indices = np.where(mask)[0]
             
-            if len(valid_indices) > 0:
-                valid_data = col[valid_indices]
-                filtered = sosfilt(sos, valid_data)
-                result[valid_indices, col_idx] = filtered
-                
-                # **중요**: 필터링 후 원본 NaN 위치 복원
-                result[~mask, col_idx] = np.nan
+            if len(valid_indices) > 0 and len(valid_indices) < len(col):
+                # 선형 보간으로 NaN 채우기
+                col_interp = np.interp(indices, valid_indices, col[valid_indices])
+            elif len(valid_indices) == 0:
+                continue  # 모두 NaN이면 스킵
+            else:
+                col_interp = col.copy()  # NaN이 없으면 그대로
+            
+            # 전체 배열에 필터 적용
+            filtered = sosfilt(sos, col_interp)
+            
+            # 필터링된 데이터의 유효한 부분만 사용
+            filtered[~mask] = np.nan
+            result[:, col_idx] = filtered
         
         return result
     
@@ -368,10 +383,10 @@ def validate_z_value(z_raw: float, z_bounds: Optional[Tuple[float, float]] = Non
 
 
 def filter_z_outliers_by_frame_delta(df_tidy: pd.DataFrame, 
-                                     joint_threshold: float = 0.4,
+                                     relative_threshold: float = 0.5,
                                      depth_scale: float = 0.001) -> pd.DataFrame:
     """
-    2단계 필터링: 프레임 간 Z 값 연속성 기반 이상치 제거
+    2단계 필터링: 프레임 간 Z 값 연속성 기반 이상치 제거 (상대적 스케일 적용)
     
     같은 관절의 연속 프레임 간 Z 변화가 threshold를 초과하면,
     이전 프레임의 값으로 대체.
@@ -380,10 +395,11 @@ def filter_z_outliers_by_frame_delta(df_tidy: pd.DataFrame,
     ----------
     df_tidy : pd.DataFrame
         Tidy format 3D skeleton (frame, person_idx, joint_idx, x, y, conf, X, Y, Z)
-    joint_threshold : float
-        프레임 간 허용 Z 변화량 (meter, 기본 0.4m)
+    relative_threshold : float
+        프레임 간 허용 Z 변화량을 평균 Z의 배수로 표현 (기본 0.5 = 50%)
+        예: 평균 Z=2000이면, 허용 변화 = 2000 * 0.5 = 1000
     depth_scale : float
-        깊이값 스케일 (기본 0.001)
+        깊이값 스케일 (기본 0.001) - 사용되지 않음 (상대적 스케일 사용)
     
     Returns
     -------
@@ -392,7 +408,7 @@ def filter_z_outliers_by_frame_delta(df_tidy: pd.DataFrame,
     
     Notes
     -----
-    - raw 깊이값 → meter로 변환하여 비교
+    - 각 관절별 평균 Z 값을 기준으로 상대적 threshold 계산
     - 튄 값은 이전 프레임값으로 대체
     - 대체할 이전값이 없으면 NaN 유지
     """
@@ -403,26 +419,30 @@ def filter_z_outliers_by_frame_delta(df_tidy: pd.DataFrame,
         indices = group.index
         z_values = df.loc[indices, 'Z'].values
         
-        # meter 단위로 변환
-        z_meter = z_values * depth_scale
+        # 유효한 Z 값 필터링
+        valid_mask = np.isfinite(z_values)
+        z_valid = z_values[valid_mask]
+        
+        if len(z_valid) < 2:
+            continue
+        
+        # 평균 Z 값 기반 상대적 threshold 계산
+        mean_z = np.mean(z_valid)
+        z_threshold = mean_z * relative_threshold  # 절대값 아님, 상대적 스케일
         
         # 프레임 간 차이 계산 (유효한 값만)
-        valid_mask = np.isfinite(z_meter)
         z_valid_indices = np.where(valid_mask)[0]
-        
-        if len(z_valid_indices) < 2:
-            continue
         
         # 연속 프레임의 Z 차이 계산
         for i in range(1, len(z_valid_indices)):
             prev_idx = z_valid_indices[i - 1]
             curr_idx = z_valid_indices[i]
             
-            # 실제 프레임 간 거리 (NaN을 건너뜀)
-            z_delta = np.abs(z_meter[curr_idx] - z_meter[prev_idx])
+            # 실제 프레임 간 거리
+            z_delta = np.abs(z_values[curr_idx] - z_values[prev_idx])
             
-            # 큰 변화 감지 → 현재값을 NaN으로 마킹
-            if z_delta > joint_threshold:
+            # 상대적 threshold 초과 → 현재값을 NaN으로 마킹
+            if z_delta > z_threshold:
                 df.loc[indices[curr_idx], 'Z'] = np.nan
                 df.loc[indices[curr_idx], 'X'] = np.nan
                 df.loc[indices[curr_idx], 'Y'] = np.nan
@@ -432,10 +452,10 @@ def filter_z_outliers_by_frame_delta(df_tidy: pd.DataFrame,
 
 def filter_z_outliers_by_frame_consistency(df_tidy: pd.DataFrame,
                                           body_part_groups: Optional[dict] = None,
-                                          consistency_threshold: float = 0.6,
+                                          relative_threshold: float = 0.3,
                                           depth_scale: float = 0.001) -> pd.DataFrame:
     """
-    3단계 필터링: 프레임 내 Z 값 일관성 기반 이상치 제거
+    3단계 필터링: 프레임 내 Z 값 일관성 기반 이상치 제거 (상대적 스케일 적용)
     
     같은 프레임 내 어깨/팔꿈치 등 신체 중심부의 중앙값을 기준으로,
     개별 관절의 Z가 크게 벗어나면 이상치로 판단.
@@ -446,10 +466,11 @@ def filter_z_outliers_by_frame_consistency(df_tidy: pd.DataFrame,
         Tidy format 3D skeleton
     body_part_groups : dict
         신체 부위별 관절 인덱스 (예: {'core': [13, 14], 'left_arm': [5, 6, 7]})
-    consistency_threshold : float
-        중앙값으로부터 허용 편차 (meter, 기본 0.6m)
+    relative_threshold : float
+        중앙값으로부터 허용 편차를 중앙값의 배수로 표현 (기본 0.3 = 30%)
+        예: 중앙값 Z=2000이면, 허용 편차 = 2000 * 0.3 = 600
     depth_scale : float
-        깊이값 스케일
+        깊이값 스케일 (기본 0.001) - 사용되지 않음 (상대적 스케일 사용)
     
     Returns
     -------
@@ -460,6 +481,7 @@ def filter_z_outliers_by_frame_consistency(df_tidy: pd.DataFrame,
     -----
     - 신체 중심(어깨, 팔꿈치)을 기준으로 일관성 검증
     - COCO-17 기준: Shoulders (11, 12), Elbows (7, 8)
+    - 상대적 threshold로 단위 독립적 필터링 구현
     """
     if body_part_groups is None:
         # COCO-17 기준 신체 부위 (joint_idx)
@@ -479,7 +501,7 @@ def filter_z_outliers_by_frame_consistency(df_tidy: pd.DataFrame,
             
             # 신체 중심부의 Z 값들 (core joints)
             core_z = person_frame[person_frame['joint_idx'].isin(body_part_groups['core'])]['Z']
-            core_z_valid = core_z.dropna() * depth_scale
+            core_z_valid = core_z.dropna()
             
             if len(core_z_valid) < 1:
                 continue
@@ -487,19 +509,20 @@ def filter_z_outliers_by_frame_consistency(df_tidy: pd.DataFrame,
             # 신체 중심의 중앙값
             core_median = np.median(core_z_valid)
             
+            # 상대적 threshold 계산 (중앙값의 배수)
+            z_threshold = core_median * relative_threshold
+            
             # 다른 관절들의 Z 일관성 검증
             for idx in person_frame.index:
                 z_val = df.loc[idx, 'Z']
                 if not np.isfinite(z_val):
                     continue
                 
-                z_meter = z_val * depth_scale
+                # 중앙값으로부터 편차 계산 (절대값)
+                z_deviation = np.abs(z_val - core_median)
                 
-                # 중앙값으로부터 편차 계산
-                z_deviation = np.abs(z_meter - core_median)
-                
-                # 편차가 threshold를 초과하면 이상치
-                if z_deviation > consistency_threshold:
+                # 편차가 상대적 threshold를 초과하면 이상치
+                if z_deviation > z_threshold:
                     df.loc[idx, 'Z'] = np.nan
                     df.loc[idx, 'X'] = np.nan
                     df.loc[idx, 'Y'] = np.nan

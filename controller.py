@@ -323,18 +323,20 @@ def run_metrics_in_process(dimension: str, ctx: dict):
         return None
 
 
-def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_skeleton: bool, dest_dir: Path):
+def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_skeleton: bool, dest_dir: Path, is_local: bool = False):
     """입력 다운로드 → OpenPose 실행 → 보간 → 결과 저장(+메트릭 실행)까지 전체 파이프라인.
 
     매개변수
-    - s3_key: 입력 객체 키(2D: mp4, 3D: zip)
+    - s3_key: 입력 객체 키(2D: mp4, 3D: zip) 또는 로컬 파일 경로
     - dimension: '2d' | '3d'
     - job_id: 산출물 파일명 접두에 쓰일 식별자
     - turbo_without_skeleton: (예약) skeleton 추출 스킵 플래그. 현재 로직에서는 사용하지 않음.
     - dest_dir: 산출물 저장 디렉터리 경로
+    - is_local: True이면 s3_key 대신 dest_dir/local_input.* 파일 사용
 
     처리 개요
-    1) S3에서 입력 다운로드 (/tmp 하위 작업 디렉터리 사용)
+    1) is_local이 False: S3에서 입력 다운로드 (/tmp 하위 작업 디렉터리 사용)
+       is_local이 True: dest_dir/local_input.* 파일을 사용
     2) 2D: mp4 → run_openpose_on_video → 프레임별 JSON 파싱 → df_2d 생성 → 원본 프레임 추출(img/)
        3D: zip → color/, depth/ 추출 → run_openpose_on_dir(color/) → 깊이 샘플링으로 Z 추정 → intrinsics로 X/Y 계산 → df_3d 생성
     3) interpolate_sequence로 people_sequence 생성(프레임별 첫 번째 사람 기준)
@@ -352,32 +354,45 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
         # Initialize fps variable for metrics pipeline (will be set from intrinsics if available)
         fps = None
 
-        # 입력 버킷을 환경변수에서 결정합니다.
-        bucket = os.environ.get('S3_VIDEO_BUCKET_NAME') or os.environ.get('S3_BUCKET') or os.environ.get('AWS_S3_BUCKET')
-        if not bucket:
-            raise RuntimeError('S3_VIDEO_BUCKET_NAME (or S3_BUCKET/AWS_S3_BUCKET) environment variable is not set')
-
-        s3 = boto3.client('s3')
-        key = s3_key.lstrip('/')
-
-        # /tmp 하위에 작업 디렉터리를 만들고(컨테이너 친화적), 디버깅을 위해 자동 삭제하지 않습니다.
-        # 운영 환경에서는 정리 정책/주기를 고려하세요.
+        # 임시 작업 디렉터리 생성
         tmpdir = tempfile.mkdtemp(dir='/tmp')
         tmp_dir = Path(tmpdir)
-        # If you later want automatic cleanup, replace above with:
-        # with tempfile.TemporaryDirectory(dir='/tmp') as tmpdir:
-        #     tmp_dir = Path(tmpdir)
         output_json_dir = tmp_dir / 'json'
         output_json_dir.mkdir(parents=True, exist_ok=True)
         output_img_dir = tmp_dir / 'img'
         output_img_dir.mkdir(parents=True, exist_ok=True)
 
+        # S3 클라이언트 초기화 (로컬 모드가 아닐 때만)
+        s3 = None
+        bucket = None
+        key = None
+        
+        if not is_local:
+            # 입력 버킷을 환경변수에서 결정합니다.
+            bucket = os.environ.get('S3_VIDEO_BUCKET_NAME') or os.environ.get('S3_BUCKET') or os.environ.get('AWS_S3_BUCKET')
+            if not bucket:
+                raise RuntimeError('S3_VIDEO_BUCKET_NAME (or S3_BUCKET/AWS_S3_BUCKET) environment variable is not set')
+            s3 = boto3.client('s3')
+            key = s3_key.lstrip('/')
+
         result_by_frame = []
 
         if dimension == '2d':  # --- 2D 처리 경로 ---
-            # download mp4
+            # download mp4 (로컬 또는 S3)
             local_video = tmp_dir / 'input.mp4'
-            s3.download_file(bucket, key, str(local_video))
+            
+            if is_local:
+                print(f"[DEBUG] 로컬 MP4 파일 복사 중...")
+                local_input_mp4 = dest_dir / 'local_input.mp4'
+                if not local_input_mp4.exists():
+                    raise RuntimeError(f"로컬 파일 모드인데 local_input.mp4를 찾을 수 없습니다: {local_input_mp4}")
+                import shutil
+                shutil.copy(str(local_input_mp4), str(local_video))
+                print(f"[DEBUG] 복사 완료: {local_video}")
+            else:
+                print(f"[DEBUG] S3에서 MP4 다운로드 중: {bucket}/{key}")
+                s3.download_file(bucket, key, str(local_video))
+                print(f"[DEBUG] 다운로드 완료: {local_video}")
 
             import cv2
             cap = cv2.VideoCapture(str(local_video))
@@ -751,7 +766,19 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
         elif dimension == '3d':  # --- 3D 처리 경로 ---
                 # download zip and extract expected color/ and depth/ folders
                 local_zip = tmp_dir / 'input.zip'
-                s3.download_file(bucket, key, str(local_zip))
+                
+                if is_local:
+                    print(f"[DEBUG] 로컬 ZIP 파일 복사 중...")
+                    local_input_zip = dest_dir / 'local_input.zip'
+                    if not local_input_zip.exists():
+                        raise RuntimeError(f"로컬 파일 모드인데 local_input.zip을 찾을 수 없습니다: {local_input_zip}")
+                    import shutil
+                    shutil.copy(str(local_input_zip), str(local_zip))
+                    print(f"[DEBUG] 복사 완료: {local_zip}")
+                else:
+                    print(f"[DEBUG] S3에서 ZIP 다운로드 중: {bucket}/{key}")
+                    s3.download_file(bucket, key, str(local_zip))
+                    print(f"[DEBUG] 다운로드 완료: {local_zip}")
 
                 # 안전한 압축 해제(zip-slip 방지)와 간단한 용량 제한 처리
                 MAX_FILES = 5000
@@ -874,43 +901,41 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
                         pass
 
                     # 깊이 스케일 추론(휴리스틱)
-                    # - intrinsics.meta.depth_scale 우선
-                    # - 샘플 통계가 크면 mm→m(0.001)로 가정
+                    # - depth 데이터의 dtype과 범위로 판정 (우선)
+                    # - fallback: intrinsics.meta.depth_scale
                     depth_scale_factor = 1.0
                     inferred_unit = 'meters'
                     fps = None  # Extract fps from intrinsics meta for metrics pipeline
                     try:
+                        # 1단계: depth dtype과 범위로 판정 (depth 데이터 자체의 단위)
+                        if depth_validation and len(depth_validation) > 0:
+                            first_depth_info = depth_validation[0]
+                            max_val = first_depth_info.get('max', 0)
+                            dtype_str = first_depth_info.get('dtype', 'float32')
+                            
+                            # float32/float64 with small values (< 100) → already meters
+                            if 'float' in dtype_str.lower() and max_val < 100:
+                                depth_scale_factor = 1.0
+                                inferred_unit = 'already_meters'
+                            # int16/uint16 with large values (> 1000) → millimeters
+                            elif 'int' in dtype_str.lower() and max_val > 1000:
+                                depth_scale_factor = 0.001
+                                inferred_unit = 'millimeters_to_meters'
+                            print(f"[INFO] Depth scale inferred from data: dtype={dtype_str}, max={max_val}, scale={depth_scale_factor}")
+                    except Exception as e:
+                        print(f"[WARN] Failed to infer depth scale from validation: {e}")
+                    
+                    try:
                         if 'intr_full' in locals() and isinstance(intr_full, dict):
                             meta = intr_full.get('meta') or intr_full.get('meta_data') or {}
                             if isinstance(meta, dict):
-                                # Extract depth_scale if present
-                                if 'depth_scale' in meta:
-                                    # intr_full may have depth_scale if raw depth was saved; prefer it
-                                    try:
-                                        ds = float(meta.get('depth_scale'))
-                                        if ds != 0 and ds != 1.0:
-                                            depth_scale_factor = ds
-                                            inferred_unit = f'raw_scale_{ds}'
-                                    except Exception:
-                                        pass
                                 # Extract fps if present (used by metrics modules for overlay MP4 generation)
                                 if 'fps' in meta:
                                     try:
                                         fps = int(meta.get('fps'))
                                         print(f"[INFO] Extracted fps={fps} from intrinsics.json meta")
-                                        print(f"[DEBUG] 3D path: fps from intrinsics.json meta = {fps}")
                                     except Exception as e:
                                         print(f"[WARN] Failed to parse fps from meta: {e}")
-                                        print(f"[DEBUG] 3D path: Exception parsing fps - {e}")
-                        # fallback heuristic based on sample stats
-                        if depth_scale_factor == 1.0:
-                            for s in depth_validation:
-                                md = s.get('median_valid')
-                                dt = s.get('dtype','')
-                                if (md is not None and md > 1000) or ('int' in dt.lower() and (s.get('max') or 0) > 1000):
-                                    depth_scale_factor = 0.001
-                                    inferred_unit = 'millimeters'
-                                    break
                     except Exception:
                         pass
 
@@ -1071,6 +1096,9 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
                     for person_idx, person in enumerate(ppl):
                         for joint_idx, (x, y, c) in enumerate(person):
                             X, Y, Zm = (np.nan, np.nan, np.nan)
+                            # Initialize 3D coordinates
+                            X, Y, Zm = np.nan, np.nan, np.nan
+                            
                             sample_info = {
                                 'frame': frame_idx,
                                 'json_name': f'{frame_idx:06d}.json',
@@ -1098,41 +1126,71 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
                                     vals = patch[np.isfinite(patch) & (patch > 0)]
                                     sample_info['vals_count'] = int(vals.size)
                                     Z_raw = float(np.median(vals)) if vals.size else np.nan
-                                    # CRITICAL FIX: Apply depth_scale_factor to convert raw depth to metric units
-                                    # raw depth (mm) × depth_scale (0.001) → depth in meters
-                                    Z = Z_raw * depth_scale_factor if (not np.isnan(Z_raw) and depth_scale_factor != 1.0) else Z_raw
-                                    sample_info['Z_median'] = None if (np.isnan(Z) or not np.isfinite(Z)) else float(Z)
+                                    # depth_scale_factor를 사용해서 미터 단위로 변환
+                                    if np.isnan(Z_raw):
+                                        Z_meter = np.nan
+                                    elif depth_scale_factor == 1.0:
+                                        Z_meter = Z_raw  # 이미 미터 단위
+                                    else:
+                                        Z_meter = Z_raw * depth_scale_factor
                                     
-                                    # 1단계 필터링: 홀/0값 검사만 수행
-                                    # (범위 필터링은 나중에 동적 bounds로 수행)
+                                    # CSV에 저장할 때는 MM 단위로: 미터 × 1000
+                                    if np.isnan(Z_meter) or not np.isfinite(Z_meter):
+                                        Z_mm = np.nan
+                                    else:
+                                        Z_mm = Z_meter * 1000.0
+                                    
+                                    sample_info['Z_median'] = None if np.isnan(Z_mm) else float(Z_mm)
+                                    
+                                    # [DEBUG] 처음 5프레임만 로그 출력
+                                    if frame_idx < 5:
+                                        print(f"[DEBUG] Frame {frame_idx}, Joint {joint_idx}: Z_raw={Z_raw:.4f}, depth_scale={depth_scale_factor}, Z_meter={Z_meter:.4f}, Z_mm={Z_mm}, sample['Z_median']={sample_info['Z_median']}")
+                                    
+                                    # Z가 유효하면 X, Y도 계산
                                     if sample_info['Z_median'] is not None:
-                                        Zm = float(sample_info['Z_median'])
-                                        # coerce intrinsics into floats and guarded access
+                                        Zm = float(sample_info['Z_median'])  # MM 단위
                                         try:
-                                            cx = float(intr.get('cx'))
-                                            cy = float(intr.get('cy'))
-                                            fx = float(intr.get('fx'))
-                                            fy = float(intr.get('fy'))
-                                            # (original behavior) do not modify Zm here; use raw sampled depth units
+                                            cx = float(intr.get('cx', 320))
+                                            cy = float(intr.get('cy', 180))
+                                            fx = float(intr.get('fx', 320))
+                                            fy = float(intr.get('fy', 180))
+                                            # X/Y를 MM 단위로 계산
                                             X = (x - cx) * Zm / fx
                                             Y = (y - cy) * Zm / fy
-                                        except Exception:
-                                            # leave X/Y as NaN if intrinsics malformed
+                                            if frame_idx < 5:
+                                                print(f"[DEBUG] Frame {frame_idx}, Joint {joint_idx}: X={X:.2f}, Y={Y:.2f}, cx={cx}, cy={cy}, fx={fx}, fy={fy}")
+                                        except Exception as e:
+                                            if frame_idx < 5:
+                                                print(f"[DEBUG] Frame {frame_idx}, Joint {joint_idx}: X/Y 계산 실패: {e}")
                                             pass
-                                except Exception:
-                                    # if anything goes wrong sampling, keep NaNs and record minimal info
+                                    elif frame_idx < 5:
+                                        print(f"[DEBUG] Frame {frame_idx}, Joint {joint_idx}: Z_median is None - X/Y 계산 스킵")
+                                except Exception as e:
+                                    if frame_idx < 5:
+                                        print(f"[DEBUG] Frame {frame_idx}, Joint {joint_idx}: Depth 샘플링 실패: {e}")
                                     pass
+                            elif frame_idx < 5:
+                                print(f"[DEBUG] Frame {frame_idx}, Joint {joint_idx}: intr={intr is not None}, depth_m={depth_m is not None} - 조건 불만족")
 
 
                             # append tidy row
+                            # [DEBUG] 모든 데이터에 대해 결과 기록
+                            x_val = float(X) if not np.isnan(X) else np.nan
+                            y_val = float(Y) if not np.isnan(Y) else np.nan
+                            z_val = float(Zm) if (not np.isnan(Zm) and Zm is not None and np.isfinite(Zm)) else np.nan
+                            
+                            if frame_idx < 5 or (not np.isnan(x_val) and np.isnan(x_val) == False):  # X가 유효한 데이터만 로그
+                                if frame_idx < 5 or frame_idx % 100 == 0:  # 처음 5프레임 + 100의 배수
+                                    print(f"[DEBUG] Storing: Frame {frame_idx}, J{joint_idx}: X={x_val}, Y={y_val}, Z={z_val} (raw Zm={Zm})")
+                            
                             rows.append({
                                 'frame': frame_idx,
                                 'person_idx': person_idx,
                                 'joint_idx': joint_idx,
                                 'x': float(x), 'y': float(y), 'conf': float(c),
-                                'X': float(X) if not np.isnan(X) else np.nan,
-                                'Y': float(Y) if not np.isnan(Y) else np.nan,
-                                'Z': float(Zm) if not np.isnan(Zm) else np.nan,
+                                'X': x_val,
+                                'Y': y_val,
+                                'Z': z_val,
                             })
                             # record sample debug for first N frames or all (keeps small)
                             if frame_idx < 200:  # limit debug size
@@ -1155,29 +1213,37 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
 
                 df_3d = pd.DataFrame(rows)
                 
+                # 디버그: X, Y, Z가 제대로 저장되었는지 확인
+                x_nans = df_3d['X'].isna().sum() if 'X' in df_3d.columns else 'NO COL'
+                y_nans = df_3d['Y'].isna().sum() if 'Y' in df_3d.columns else 'NO COL'
+                z_nans = df_3d['Z'].isna().sum() if 'Z' in df_3d.columns else 'NO COL'
+                print(f"[INFO] df_3d NaN counts (BEFORE filtering): X={x_nans}, Y={y_nans}, Z={z_nans} (total rows={len(df_3d)})")
+                
                 # 3D 필터링 적용 (metric 계산 전) - 프레임 간 연속성 + 프레임 내 일관성
+                # 상대적 스케일 기반 필터링: 단위(mm/m/cm)에 무관하게 작동
                 if not df_3d.empty and 'Z' in df_3d.columns:
                     try:
-                        # 2단계: 프레임 간 Z 연속성 필터링
-                        filter_depth_scale = depth_scale_factor if depth_scale_factor != 1.0 else 0.001
-                        df_3d = filter_z_outliers_by_frame_delta(df_3d, joint_threshold=0.4, depth_scale=filter_depth_scale)
-                        print("[INFO] Applied frame-delta Z filtering")
+                        # 2단계: 프레임 간 Z 연속성 필터링 (상대적 threshold)
+                        # relative_threshold=0.5 → 각 관절의 평균 Z의 50% 이상 변화는 이상치로 판단
+                        df_3d = filter_z_outliers_by_frame_delta(df_3d, relative_threshold=0.5)
+                        x_nans_after = df_3d['X'].isna().sum()
+                        print(f"[INFO] After frame-delta filtering: X NaN count = {x_nans_after}")
                     except Exception as e:
                         print(f"[WARN] Frame delta filtering failed: {e}")
                     
                     try:
-                        # 3단계: 프레임 내 Z 일관성 필터링
-                        filter_depth_scale = depth_scale_factor if depth_scale_factor != 1.0 else 0.001
+                        # 3단계: 프레임 내 Z 일관성 필터링 (상대적 threshold)
+                        # relative_threshold=0.3 → 신체 중심 Z의 30% 이상 벗어나면 이상치로 판단
                         df_3d = filter_z_outliers_by_frame_consistency(
                             df_3d,
                             body_part_groups={
                                 'core': [11, 12],  # LShoulder, RShoulder (COCO-17)
                                 'upper_limbs': [5, 6, 7, 8]
                             },
-                            consistency_threshold=0.6,
-                            depth_scale=filter_depth_scale
+                            relative_threshold=0.3
                         )
-                        print("[INFO] Applied frame-consistency Z filtering")
+                        x_nans_after = df_3d['X'].isna().sum()
+                        print(f"[INFO] After frame-consistency filtering: X NaN count = {x_nans_after}")
                     except Exception as e:
                         print(f"[WARN] Frame consistency filtering failed: {e}")
 
@@ -1205,18 +1271,37 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
                     # Use the filtered df_3d directly to convert to wide format
                     wide3 = tidy_to_wide(df_3d, dimension='3d', person_idx=0) if (not df_3d.empty) else pd.DataFrame()
                     
+                    # [DEBUG] tidy_to_wide 변환 후 좌표 범위 확인
+                    if not wide3.empty:
+                        try:
+                            nose_x_col = [c for c in wide3.columns if 'Nose' in c and 'x' in c.lower()]
+                            if nose_x_col:
+                                x_vals = wide3[nose_x_col[0]].dropna()
+                                if len(x_vals) > 0:
+                                    print(f"[DEBUG] tidy_to_wide 후 Nose__x 범위: [{x_vals.min():.4f}, {x_vals.max():.4f}]")
+                        except Exception:
+                            pass
+                    
                     # Apply Butterworth smoothing to 3D coordinates
                     if isinstance(wide3, pd.DataFrame) and not wide3.empty:
                         try:
-                            from metric_algorithm.smoothing import smooth_skeleton_wide
-                            # Apply low-pass filter with cutoff 0.1 (Nyquist frequency)
-                            # order=2 (Butterworth 2nd order), fps from intrinsics metadata
-                            smoothing_fps = fps if fps is not None else 30.0
-                            wide3_smooth = smooth_skeleton_wide(wide3, order=2, cutoff=0.1, fps=smoothing_fps, dimension='3d')
-                            wide3 = wide3_smooth
-                            print("[INFO] Applied Butterworth smoothing to 3D skeleton")
+                            # [임시] 스무딩 비활성화 - 좌표값 축소 현상으로 인해 skip
+                            # Butterworth 필터가 선형 보간 후 필터링하면서 엣지 값을 축소시킴
+                            # 데이터가 이미 Z 필터링되어 있으므로 추가 스무딩 불필요
+                            wide3_smooth = wide3
+                            print("[INFO] 3D skeleton smoothing skipped (coordinates already filtered)")
+                            
+                            # [DEBUG] smoothing 후 좌표 범위 확인
+                            try:
+                                nose_x_col = [c for c in wide3.columns if 'Nose' in c and 'x' in c.lower()]
+                                if nose_x_col:
+                                    x_vals = wide3[nose_x_col[0]].dropna()
+                                    if len(x_vals) > 0:
+                                        print(f"[DEBUG] 스무딩 스킵 후 Nose__x 범위: [{x_vals.min():.4f}, {x_vals.max():.4f}]")
+                            except Exception:
+                                pass
                         except Exception as e:
-                            print(f"[WARN] 3D smoothing failed: {e}")
+                            print(f"[WARN] 3D smoothing skip failed: {e}")
                             traceback.print_exc()
                 except Exception:
                     wide3 = pd.DataFrame()

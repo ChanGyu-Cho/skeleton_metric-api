@@ -694,29 +694,47 @@ def _coord_scale_to_m(cfg: dict) -> float:
                 except (TypeError, ValueError):
                     pass
     
-    # 2단계: analyze.yaml의 coord_unit 명시 설정
-    unit = (cfg.get("coord_unit", "m") or "m").strip().lower()
+    # 2단계: analyze.yaml의 coord_unit 명시 설정 (선택적, wide3이 있으면 skip)
+    if 'wide3' not in cfg:  # wide3이 없을 때만 coord_unit 사용
+        unit = (cfg.get("coord_unit", "m") or "m").strip().lower()
+        
+        if unit in ("m", "meter", "metre", "meters"):
+            print(f"[INFO] coord_unit='m' 사용 → scale_to_m=1.0")
+            return 1.0
+        if unit in ("cm", "centimeter", "centimetre", "centimeters"):
+            print(f"[INFO] coord_unit='cm' 사용 → scale_to_m=0.01")
+            return 1e-2
+        if unit in ("mm", "millimeter", "millimetre", "millimeters"):
+            print(f"[INFO] coord_unit='mm' 사용 → scale_to_m=0.001")
+            return 1e-3
     
-    if unit in ("m", "meter", "metre", "meters"):
-        print(f"[INFO] coord_unit='m' 사용 → scale_to_m=1.0")
-        return 1.0
-    if unit in ("cm", "centimeter", "centimetre", "centimeters"):
-        print(f"[INFO] coord_unit='cm' 사용 → scale_to_m=0.01")
-        return 1e-2
-    if unit in ("mm", "millimeter", "millimetre", "millimeters"):
-        print(f"[INFO] coord_unit='mm' 사용 → scale_to_m=0.001")
-        return 1e-3
+    # 2.5단계: intrinsics에서 depth_scale 확인
+    # controller.py가 CSV에 저장한 좌표는 MM 단위이므로, depth_scale이 있으면 MM 좌표로 간주
+    try:
+        intrinsics = cfg.get('intrinsics')
+        if intrinsics and isinstance(intrinsics, dict):
+            meta = intrinsics.get('meta', {})
+            depth_scale = meta.get('depth_scale')
+            if depth_scale and 0.0001 <= float(depth_scale) <= 0.01:
+                # depth_scale이 0.001 정도이면 원본 depth가 MM이고,
+                # controller에서 CSV에 MM 단위로 저장했다는 뜻
+                print(f"[DEBUG] intrinsics 감지: depth_scale={depth_scale} → CSV 좌표는 MM 단위")
+                print(f"[INFO] 🎯 intrinsics depth_scale 감지 → scale_to_m=0.001 (CSV가 MM 단위)")
+                return 1e-3
+    except Exception as e:
+        print(f"[DEBUG] intrinsics 확인 실패: {e}")
     
     # 3단계: wide3 데이터로부터 자동 감지 (좌표 범위 기반)
     try:
         wide3 = cfg.get("wide3")
         if wide3 is not None and hasattr(wide3, 'columns'):
-            # 3D 컬럼 찾기 (대소문자 무시, X3D/Y3D/Z3D 또는 _X/_Y/_Z 패턴)
+            # 3D 컬럼 찾기 (대소문자 무시, X3D/Y3D/Z3D 또는 __x/__y/__z 또는 _x/_y/_z 패턴)
             coord_cols = [c for c in wide3.columns if any(
-                x.lower() in c.lower() for x in ('x3d', 'y3d', 'z3d', '_x', '_y', '_z')
-            ) and (c.lower().endswith(('x3d', 'y3d', 'z3d', '_x', '_y', '_z')))]
+                x.lower() in c.lower() for x in ('x3d', 'y3d', 'z3d', '__x', '__y', '__z', '_x', '_y', '_z')
+            ) and (c.lower().endswith(('x3d', 'y3d', 'z3d', '__x', '__y', '__z', '_x', '_y', '_z')))]
             
             if coord_cols:
+                print(f"[DEBUG] 감지된 3D 컬럼: {coord_cols[:5]}... (총 {len(coord_cols)}개)")
                 all_vals = []
                 for col in coord_cols:
                     try:
@@ -733,18 +751,34 @@ def _coord_scale_to_m(cfg: dict) -> float:
                     
                     # Heuristic으로 단위 판정
                     # 1) 카메라 정규화: 0.0001 ~ 0.001 범위
-                    # 2) mm 단위: 0.01 ~ 100 범위 (10~1000 mm)
+                    # 2) MM 단위 (controller 저장): 100 ~ 3000 범위
                     # 3) m 단위: 0.1 ~ 10 범위
+                    # 4) CM 단위 또는 평활화된 좌표: 0.1 ~ 500 범위
                     
-                    if min_val >= 0.0001 and max_val < 0.01:
+                    if min_val >= 0.0001 and max_val < 0.001:
                         print(f"[INFO] 🎯 카메라 정규화 좌표 감지 → scale_to_m=1.0 (이미 m 단위)")
                         return 1.0
-                    elif min_val >= 0.01 and max_val <= 1000:
-                        print(f"[INFO] 🎯 mm 범위 좌표 감지 → scale_to_m=0.001 (mm→m 변환)")
+                    elif max_val >= 100:
+                        # 100 이상이면 MM 범위로 간주 (카메라 이미지 크기 기반)
+                        print(f"[INFO] 🎯 MM 범위 좌표 감지 (max={max_val:.2f}) → scale_to_m=0.001 (MM→m 변환)")
                         return 1e-3
                     elif min_val >= 1 and max_val <= 10:
                         print(f"[INFO] 🎯 m 범위 좌표 감지 → scale_to_m=1.0 (이미 m 단위)")
                         return 1.0
+                    elif min_val >= 0.1 and max_val < 100:
+                        # Smoothing이나 변환 후 스케일 (0.1~100 범위)
+                        print(f"[INFO] 🎯 평활화/변환된 좌표 범위 감지 [{min_val:.2f}, {max_val:.2f}]")
+                        # max_val 기반으로 판정: 
+                        # - max < 50: CM 또는 m 범위 → 0.01 (cm) 또는 1.0 (m)
+                        # - max >= 50: MM/10 스케일 → 0.001
+                        if max_val >= 50:
+                            print(f"[INFO]    → scale_to_m=0.001 (MM → m 변환)")
+                            return 0.001
+                        else:
+                            print(f"[INFO]    → scale_to_m=0.01 (CM 또는 평활화 좌표 → m 변환)")
+                            return 0.01
+            else:
+                print(f"[DEBUG] 3D 컬럼을 찾을 수 없음. 존재하는 컬럼: {list(wide3.columns)[:10]}")
     except Exception as e:
         print(f"[WARN] 자동 감지 실패: {e}")
     

@@ -22,6 +22,8 @@ class OpenPoseRequest(BaseModel):
     s3_key: Optional[str] = None
     file_base64: Optional[str] = None
     turbo_without_skeleton: Optional[bool] = True
+    mime_type: Optional[str] = None
+    is_local: Optional[bool] = False
 
 # NOTE: OpenPose logic has been moved to `openpose/openpose.py` and is imported above.
 
@@ -65,6 +67,29 @@ async def skeleton_metric_predict(req: OpenPoseRequest, background_tasks: Backgr
         dest_dir = base_dir / user_id / job_id  # /opt/skeleton_metric-api/<user_id>/<job_id>/ 폴더
         dest_dir.mkdir(parents=True, exist_ok=True)
 
+        # Handle local file mode: if 'video' field contains base64 and 'is_local' is True,
+        # decode it and save to dest_dir so controller can use it as a local file instead of S3
+        local_file_path = None
+        if req.is_local and req.video:
+            try:
+                print(f"[DEBUG] 로컬 파일 모드 감지: is_local={req.is_local}")
+                file_data = base64.b64decode(req.video)
+                # Determine file extension from MIME type or default
+                if req.mime_type == 'video/mp4':
+                    file_ext = '.mp4'
+                elif req.mime_type == 'application/zip':
+                    file_ext = '.zip'
+                else:
+                    file_ext = '.zip' if dimension == '3d' else '.mp4'
+                
+                local_file_path = dest_dir / f"local_input{file_ext}"
+                with local_file_path.open('wb') as f:
+                    f.write(file_data)
+                print(f"[DEBUG] 로컬 파일 저장 완료: {local_file_path} ({len(file_data)} bytes)")
+            except Exception as e:
+                print(f"[WARN] 로컬 파일 저장 실패: {e}")
+                traceback.print_exc()
+
         # save sanitized payload metadata
         try:
             pdata = req.dict()
@@ -79,8 +104,9 @@ async def skeleton_metric_predict(req: OpenPoseRequest, background_tasks: Backgr
             traceback.print_exc()
 
         # schedule background processing: controller will download video from S3 using s3_key
+        # or use local file if is_local is True
         # pass dimension and job_id so controller can handle 2d(mp4) vs 3d(zip) and name result as <job_id>.json
-        background_tasks.add_task(process_and_save, req.s3_key, dimension, job_id, turbo_without_skeleton, dest_dir)
+        background_tasks.add_task(process_and_save, req.s3_key, dimension, job_id, turbo_without_skeleton, dest_dir, req.is_local)
         # schedule upload of result.json and overlay videos to result S3 bucket after processing
         
         # background_tasks.add_task(upload_result_to_s3, dest_dir, job_id, s3_key)
