@@ -344,11 +344,11 @@ def compute_xfactor(df: pd.DataFrame) -> Dict[str, any]:
         xf_abs = np.abs(xf_raw)
         # 7.5) 스무딩 (절댓값, 노이즈 제거)
         xf_smooth = smooth_median_then_moving(xf_abs, w=5)
-        # 8) 범위 제한: [0, 100]
+        # 8) 범위 제한: [0, 180]
         #    참고: 골프에서 X-Factor는 일반적으로 0-60도 범위 (최대 ~75도)
         #    과거 151도 오류는 부호 변화로 인한 artifact (이제 수정됨)
-        #    100도까지 허용하여 극단적 자세도 캡처 가능
-        xf_smooth = np.clip(xf_smooth, 0, 100)
+        #    180도까지 허용하여 극단적 자세도 캡처 가능 (물리적 최대값)
+        xf_smooth = np.clip(xf_smooth, 0, 180)
         xf_by_plane[name] = xf_smooth
 
     # 9) 임팩트 프레임 탐지
@@ -366,6 +366,31 @@ def compute_xfactor(df: pd.DataFrame) -> Dict[str, any]:
             xf_max = float(np.nanmax(pre))
             xf_max_frame = int(np.nanargmax(pre))
         xf_at_impact = float(xf[impact_idx]) if 0 <= impact_idx < len(xf) else np.nan
+        
+        # DEBUG: impact frame의 xfactor 값이 NaN인지 확인
+        print(f"[DEBUG] Plane: {name}, impact_idx: {impact_idx}, len(xf): {len(xf)}")
+        print(f"[DEBUG] xf[impact_idx]: {xf[impact_idx]}, xf_at_impact: {xf_at_impact}")
+        print(f"[DEBUG] np.isfinite(xf_at_impact): {np.isfinite(xf_at_impact)}")
+        
+        # FIX: impact frame에서 NaN이면, impact frame 근처의 유효한 값 사용
+        if not np.isfinite(xf_at_impact):
+            # impact_idx 근처에서 유효한 값을 찾기 (±5 프레임 범위)
+            search_range = 5
+            found_valid = False
+            for offset in range(search_range, 0, -1):
+                if impact_idx - offset >= 0 and np.isfinite(xf[impact_idx - offset]):
+                    xf_at_impact = float(xf[impact_idx - offset])
+                    print(f"[DEBUG] impact frame NaN → frame {impact_idx - offset}의 값 사용: {xf_at_impact}")
+                    found_valid = True
+                    break
+            if not found_valid:
+                for offset in range(1, search_range + 1):
+                    if impact_idx + offset < len(xf) and np.isfinite(xf[impact_idx + offset]):
+                        xf_at_impact = float(xf[impact_idx + offset])
+                        print(f"[DEBUG] impact frame NaN → frame {impact_idx + offset}의 값 사용: {xf_at_impact}")
+                        found_valid = True
+                        break
+        
         stats[name] = {
             'xfactor_max_deg': xf_max,
             'xfactor_max_frame': xf_max_frame,
@@ -748,9 +773,8 @@ def run_from_context(ctx: dict):
         chosen = result.get('chosen_plane', 'X-Z')
         if chosen in xf_by_plane:
             series = xf_by_plane[chosen]
-            # 최종 안전장치: 음수 제거 및 [0, 180] 범위 강제
-            series = np.abs(series)
-            series = np.clip(series, 0, 180)
+            # NOTE: series는 이미 compute_xfactor에서 [0, 180]으로 클리핑되어 있음
+            # 추가 처리 불필요 (절댓값도 이미 적용됨)
             
             # JSON 형식으로 timeseries 저장 (항상 양수)
             frames_obj = {str(i): {"xfactor_deg": (float(v) if np.isfinite(v) else None)} for i, v in enumerate(series)}

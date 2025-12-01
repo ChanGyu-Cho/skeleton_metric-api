@@ -10,7 +10,16 @@ Usage examples:
 	m = get_metric_module('com_speed')
 	# then call m.compute_com_points_3d(...) as appropriate
 """
-from . import com_speed, head_speed, shoulder_sway, swing_speed, xfactor, utils_io
+from . import com_speed, head_speed, shoulder_sway, swing_speed, utils_io
+import traceback
+try:
+	from . import xfactor
+	print("[DEBUG] xfactor module imported successfully")
+except Exception as e:
+	print(f"[ERROR] Failed to import xfactor module: {e}")
+	print(traceback.format_exc())
+	xfactor = None
+
 import os
 import boto3
 from pathlib import Path
@@ -204,8 +213,20 @@ def run_metrics_from_context(ctx: dict, dest_dir: str, job_id: str, dimension: s
 	print(f"[DEBUG] module_ctx has 'fps' key: {'fps' in module_ctx}")
 	if 'fps' in module_ctx:
 		print(f"[DEBUG] module_ctx['fps'] = {module_ctx['fps']}")
+	
+	# DEBUG: METRIC_MODULES 확인
+	print(f"[DEBUG] METRIC_MODULES keys: {list(METRIC_MODULES.keys())}")
+	print(f"[DEBUG] 메트릭 루프 시작 (총 {len(METRIC_MODULES)}개)")
+	
 	for name, mod in METRIC_MODULES.items():
 		try:
+			# DEBUG: xfactor 호출 체크
+			if name == 'xfactor':
+				print(f"[DEBUG] xfactor module found, dimension={dimension}")
+				print(f"[DEBUG] hasattr(mod, 'run_from_context'): {hasattr(mod, 'run_from_context')}")
+				if hasattr(mod, 'run_from_context'):
+					print(f"[DEBUG] callable(mod.run_from_context): {callable(getattr(mod, 'run_from_context'))}")
+			
 			# Skip xfactor for pure 2D runs: xfactor needs 3D metrics for correct results
 			if name == 'xfactor' and str(dimension).lower() == '2d':
 				out['metrics'][name] = {'skipped': True, 'reason': 'xfactor requires 3D metrics; skipped for 2D run'}

@@ -1219,33 +1219,64 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
                 z_nans = df_3d['Z'].isna().sum() if 'Z' in df_3d.columns else 'NO COL'
                 print(f"[INFO] df_3d NaN counts (BEFORE filtering): X={x_nans}, Y={y_nans}, Z={z_nans} (total rows={len(df_3d)})")
                 
-                # 3D 필터링 적용 (metric 계산 전) - 프레임 간 연속성 + 프레임 내 일관성
-                # 상대적 스케일 기반 필터링: 단위(mm/m/cm)에 무관하게 작동
+                # CRITICAL: Apply interpolation to df_3d BEFORE filtering+metrics
+                # df_3d is in tidy format: frame, person_idx, joint_idx, x, y, conf, X, Y, Z
+                # Interpolate each joint's X/Y/Z independently across frames
                 if not df_3d.empty and 'Z' in df_3d.columns:
                     try:
-                        # 2단계: 프레임 간 Z 연속성 필터링 (상대적 threshold)
-                        # relative_threshold=0.5 → 각 관절의 평균 Z의 50% 이상 변화는 이상치로 판단
-                        df_3d = filter_z_outliers_by_frame_delta(df_3d, relative_threshold=0.5)
-                        x_nans_after = df_3d['X'].isna().sum()
-                        print(f"[INFO] After frame-delta filtering: X NaN count = {x_nans_after}")
+                        print("[INFO] Applying interpolation to df_3d (tidy format)...")
+                        n_nans_before = df_3d[['X', 'Y', 'Z']].isna().sum().sum()
+                        print(f"[DEBUG] df_3d NaN BEFORE interp: X={df_3d['X'].isna().sum()}, Y={df_3d['Y'].isna().sum()}, Z={df_3d['Z'].isna().sum()}")
+                        
+                        # Group by joint_idx and person_idx, then interpolate each group independently
+                        df_3d_interp = df_3d.copy()
+                        
+                        # Interpolate each joint's coordinates
+                        for person_idx in df_3d['person_idx'].unique():
+                            for joint_idx in df_3d['joint_idx'].unique():
+                                mask = (df_3d_interp['person_idx'] == person_idx) & (df_3d_interp['joint_idx'] == joint_idx)
+                                if not mask.any():
+                                    continue
+                                
+                                # Get the subset for this joint
+                                joint_data = df_3d_interp.loc[mask].copy()
+                                
+                                # Interpolate X, Y, Z
+                                for col in ['X', 'Y', 'Z']:
+                                    if col in joint_data.columns:
+                                        # Linear interpolate → forward fill → backward fill → zero fill
+                                        joint_data[col] = joint_data[col].interpolate(method='linear', limit=None, limit_direction='both')
+                                        joint_data[col] = joint_data[col].ffill(limit=None)
+                                        joint_data[col] = joint_data[col].bfill(limit=None)
+                                        joint_data[col] = joint_data[col].fillna(0.0)
+                                
+                                # Update df_3d_interp with interpolated values
+                                df_3d_interp.loc[mask, ['X', 'Y', 'Z']] = joint_data[['X', 'Y', 'Z']]
+                        
+                        df_3d = df_3d_interp
+                        n_nans_after = df_3d[['X', 'Y', 'Z']].isna().sum().sum()
+                        print(f"[INFO] df_3d interpolation complete: NaN count {n_nans_before} → {n_nans_after}")
+                        print(f"[DEBUG] df_3d NaN AFTER interp: X={df_3d['X'].isna().sum()}, Y={df_3d['Y'].isna().sum()}, Z={df_3d['Z'].isna().sum()}")
                     except Exception as e:
-                        print(f"[WARN] Frame delta filtering failed: {e}")
-                    
-                    try:
-                        # 3단계: 프레임 내 Z 일관성 필터링 (상대적 threshold)
-                        # relative_threshold=0.3 → 신체 중심 Z의 30% 이상 벗어나면 이상치로 판단
-                        df_3d = filter_z_outliers_by_frame_consistency(
-                            df_3d,
-                            body_part_groups={
-                                'core': [11, 12],  # LShoulder, RShoulder (COCO-17)
-                                'upper_limbs': [5, 6, 7, 8]
-                            },
-                            relative_threshold=0.3
-                        )
-                        x_nans_after = df_3d['X'].isna().sum()
-                        print(f"[INFO] After frame-consistency filtering: X NaN count = {x_nans_after}")
-                    except Exception as e:
-                        print(f"[WARN] Frame consistency filtering failed: {e}")
+                        print(f"[WARN] df_3d interpolation failed: {e}")
+                        traceback.print_exc()
+                
+                # 3D 필터링 DISABLED - 필터링이 새로운 NaN을 생성하여 보간 효과를 무효화
+                # 깊이값 샘플링(median) 단계에서 이미 outlier가 제거되었으므로 필터링 불필요
+                # NOTE: 나중에 metrics 계산 중에 추가 필터링이 필요하면 metric 모듈 내에서 수행
+                #
+                # if not df_3d.empty and 'Z' in df_3d.columns:
+                #     try:
+                #         df_3d = filter_z_outliers_by_frame_delta(df_3d, relative_threshold=0.5)
+                #         ...
+                #     except Exception as e:
+                #         print(f"[WARN] Frame delta filtering failed: {e}")
+                #     
+                #     try:
+                #         df_3d = filter_z_outliers_by_frame_consistency(df_3d, ...)
+                #         ...
+                #     except Exception as e:
+                #         print(f"[WARN] Frame consistency filtering failed: {e}")
 
                 # Build a 2D tidy DataFrame (frame, person_idx, joint_idx, x, y, conf)
                 # using the parsed OpenPose JSON (result_by_frame) so overlay uses pure 2D pixel coords.
@@ -1266,49 +1297,39 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
                 except Exception:
                     wide2 = pd.DataFrame()
 
+                # CRITICAL: Convert df_3d (already interpolated) to wide format ONCE
+                # wide3 is used both for CSV output AND for metrics - atomic operation
                 try:
-                    # df_3d already contains rows with X,Y,Z columns (and has been filtered)
-                    # Use the filtered df_3d directly to convert to wide format
+                    from metric_algorithm.runner_utils import tidy_to_wide
+                    # df_3d is already interpolated and filtered above, just convert to wide format
                     wide3 = tidy_to_wide(df_3d, dimension='3d', person_idx=0) if (not df_3d.empty) else pd.DataFrame()
                     
-                    # [DEBUG] tidy_to_wide 변환 후 좌표 범위 확인
+                    # [DEBUG] 보간 후 wide3 NaN 상태 확인
+                    print(f"[DEBUG] After tidy_to_wide conversion:")
+                    print(f"[DEBUG]   wide3 shape: {wide3.shape}")
+                    print(f"[DEBUG]   wide3 total NaN count: {wide3.isna().sum().sum()}")
                     if not wide3.empty:
+                        # Check specific joint columns
+                        shoulder_cols = [c for c in wide3.columns if 'Shoulder' in c]
+                        hip_cols = [c for c in wide3.columns if 'Hip' in c]
+                        print(f"[DEBUG]   LShoulder NaN: {wide3[[c for c in shoulder_cols if 'LShoulder' in c]].isna().sum().sum() if shoulder_cols else 'N/A'}")
+                        print(f"[DEBUG]   RShoulder NaN: {wide3[[c for c in shoulder_cols if 'RShoulder' in c]].isna().sum().sum() if shoulder_cols else 'N/A'}")
+                        print(f"[DEBUG]   LHip NaN: {wide3[[c for c in hip_cols if 'LHip' in c]].isna().sum().sum() if hip_cols else 'N/A'}")
+                        print(f"[DEBUG]   RHip NaN: {wide3[[c for c in hip_cols if 'RHip' in c]].isna().sum().sum() if hip_cols else 'N/A'}")
+                        
+                        # Check first few rows
                         try:
-                            nose_x_col = [c for c in wide3.columns if 'Nose' in c and 'x' in c.lower()]
-                            if nose_x_col:
-                                x_vals = wide3[nose_x_col[0]].dropna()
-                                if len(x_vals) > 0:
-                                    print(f"[DEBUG] tidy_to_wide 후 Nose__x 범위: [{x_vals.min():.4f}, {x_vals.max():.4f}]")
+                            print(f"[DEBUG] wide3 first row: {wide3.iloc[0].to_dict() if len(wide3) > 0 else 'empty'}")
                         except Exception:
                             pass
-                    
-                    # Apply Butterworth smoothing to 3D coordinates
-                    if isinstance(wide3, pd.DataFrame) and not wide3.empty:
-                        try:
-                            # [임시] 스무딩 비활성화 - 좌표값 축소 현상으로 인해 skip
-                            # Butterworth 필터가 선형 보간 후 필터링하면서 엣지 값을 축소시킴
-                            # 데이터가 이미 Z 필터링되어 있으므로 추가 스무딩 불필요
-                            wide3_smooth = wide3
-                            print("[INFO] 3D skeleton smoothing skipped (coordinates already filtered)")
-                            
-                            # [DEBUG] smoothing 후 좌표 범위 확인
-                            try:
-                                nose_x_col = [c for c in wide3.columns if 'Nose' in c and 'x' in c.lower()]
-                                if nose_x_col:
-                                    x_vals = wide3[nose_x_col[0]].dropna()
-                                    if len(x_vals) > 0:
-                                        print(f"[DEBUG] 스무딩 스킵 후 Nose__x 범위: [{x_vals.min():.4f}, {x_vals.max():.4f}]")
-                            except Exception:
-                                pass
-                        except Exception as e:
-                            print(f"[WARN] 3D smoothing skip failed: {e}")
-                            traceback.print_exc()
-                except Exception:
+                except Exception as e:
+                    print(f"[ERROR] tidy_to_wide conversion failed: {e}")
+                    traceback.print_exc()
                     wide3 = pd.DataFrame()
 
                 # CRITICAL: Save 3D skeleton CSV (matching 2D skeleton2d.csv format)
                 # Save skeleton3d.csv with wide3 format (frame-by-frame, COCO joints with X/Y/Z coordinates)
-                # 주의: 필터링은 이미 df_3d 생성 직후에 적용됨 (metric 계산 전)
+                # NOTE: wide3 comes from already-interpolated df_3d, so no duplicate interpolation
                 try:
                     csv_dir = Path(dest_dir) / 'csv'
                     csv_dir.mkdir(parents=True, exist_ok=True)
