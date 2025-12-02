@@ -197,7 +197,8 @@ def run_metrics_from_context(ctx: dict, dest_dir: str, job_id: str, dimension: s
 	# original ctx so modules that expect fps/codec/draw/etc still work when
 	# controller supplied them. Use None when not present so modules can fall
 	# back to their defaults.
-	for _k in ('fps', 'codec', 'draw', 'landmarks', 'm_per_px_2d', 'calibration_2d', 'subject'):
+	# IMPORTANT: Include 'intrinsics' so swing_speed can access depth_scale for 3D coordinate scaling
+	for _k in ('fps', 'codec', 'draw', 'landmarks', 'm_per_px_2d', 'calibration_2d', 'subject', 'intrinsics'):
 		# Only add the key if the original ctx explicitly provided a non-None value.
 		# This preserves module-level default fallbacks like ctx.get('fps', 30).
 		try:

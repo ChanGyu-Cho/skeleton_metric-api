@@ -5,8 +5,10 @@ X-Factor 전용 분석기
 
 X-Factor의 정의 (골프):
   - 상체(어깨라인)와 하체(골반라인)의 회전 각도 차이를 나타냄
-  - 항상 양수 범위: 0°~180° (절댓값 기반)
-  - 이상적 범위: 25°~50° (특히 45°에 최적화)
+  - 음수: 왼쪽 회전 (counterclockwise)
+  - 양수: 오른쪽 회전 (clockwise)
+  - 범위: [-180°, 180°] (방향 정보 유지)
+  - 이상적 크기(절댓값): 25°~50° (특히 45°에 최적화)
 
 계산 단계:
  1) 3D 좌표 읽기 (L/R Shoulder, L/R Hip)
@@ -14,17 +16,18 @@ X-Factor의 정의 (골프):
  3) 프레임별 벡터 방향 일관화 (dot<0이면 부호 반전)
  4) 3개 평면(X-Z, X-Y, Y-Z)에서 회전각 계산 (atan2)
  5) 각도 언랩(np.unwrap)
- 6) X-Factor = |shoulder_angle - pelvis_angle| (절댓값 기반)
- 7) 스무딩(Median5 + Moving5)
- 8) 범위 정규화([0, 180])
+ 6) X-Factor = shoulder_angle - pelvis_angle (최소 거리 원칙, 부호 유지)
+ 7) 스무딩(Median5 + Moving5, 음수 각도 유지)
+ 8) 범위 정규화([-180, 180])
  9) 임팩트 탐지 (RWrist_X3D가 stance_mid를 +방향으로 교차하는 첫 프레임)
-10) 임팩트 전 최대값/프레임, 임팩트 시 값 (양수 범위만 계산)
-11) 최적 평면 자동 선택: 5<median<80 후보 중 IQR(q90-q10) 최소
+10) 임팩트 전 최대값/프레임, 임팩트 시 값 (절댓값 기준 최대, 부호 포함 값 저장)
+11) 최적 평면 자동 선택: 5<|median|<80 후보 중 IQR(q90-q10) 최소
 12) 결과 저장(JSON) 및 타임시리즈 CSV
 
 버전 히스토리:
   - v1.0: 초기 구현 (음수 범위 지원 - 부정확함)
   - v2.0: 절댓값 기반 (양수 범위만) - 골프 X-Factor 정의에 맞춤
+  - v3.0: 음수 각도 표현으로 변경 - 왼쪽/오른쪽 회전 방향 정보 유지
 """
 import argparse
 from pathlib import Path
@@ -202,6 +205,12 @@ def smooth_df_2d(
 # =========================================================
 """
 단계별 알고리즘 보조 함수들 (3~11)
+
+X-Factor 계산 로직:
+  - 음수 각도: 왼쪽 회전 (counterclockwise rotation)
+  - 양수 각도: 오른쪽 회전 (clockwise rotation)
+  - [-180, 180] 범위에서 방향 정보 유지
+  - 최대값 선택 시 절댓값 기준으로 크기 비교
 """
 def ensure_direction_continuity(V: np.ndarray) -> np.ndarray:
     """벡터 시퀀스의 방향 연속성 보장
@@ -338,33 +347,36 @@ def compute_xfactor(df: pd.DataFrame) -> Dict[str, any]:
         shoulder_angle = angles_deg_for_plane(shoulder_vec, ax_a, ax_b)
         pelvis_angle   = angles_deg_for_plane(pelvis_vec, ax_a, ax_b)
         # X-Factor raw = 상체 각도 - 하체 각도 (최소 거리 원칙: 항상 -180~180 범위)
+        # 음수 각도: 왼쪽 회전, 양수 각도: 오른쪽 회전을 나타냅니다.
         xf_raw = np.array([shortest_angle_diff(sh, pe) 
                            for sh, pe in zip(shoulder_angle, pelvis_angle)])
-        # 7) 절댓값 변환 (X-Factor는 크기만 필요) - 스무딩 전에 수행하여 부호 변화 제거
-        xf_abs = np.abs(xf_raw)
-        # 7.5) 스무딩 (절댓값, 노이즈 제거)
-        xf_smooth = smooth_median_then_moving(xf_abs, w=5)
-        # 8) 범위 제한: [0, 180]
-        #    참고: 골프에서 X-Factor는 일반적으로 0-60도 범위 (최대 ~75도)
-        #    과거 151도 오류는 부호 변화로 인한 artifact (이제 수정됨)
-        #    180도까지 허용하여 극단적 자세도 캡처 가능 (물리적 최대값)
-        xf_smooth = np.clip(xf_smooth, 0, 180)
+        # 7) 스무딩 (음수 각도 유지, 노이즈 제거)
+        # 절댓값을 계산하지 않으므로 부호 정보가 보존됩니다.
+        xf_smooth = smooth_median_then_moving(xf_raw, w=5)
+        # 8) 범위 제한: [-180, 180]
+        #    참고: X-Factor는 음수(왼쪽 회전) ~ 양수(오른쪽 회전)로 표현
+        #    -180~180 범위 내에서 각도 방향을 유지합니다.
+        xf_smooth = np.clip(xf_smooth, -180, 180)
         xf_by_plane[name] = xf_smooth
 
     # 9) 임팩트 프레임 탐지
     impact_idx = detect_impact_by_crossing(df)
 
-    # 10) 임팩트 전 최대/프레임, 임팩트 시 값 (평면별 통계)
-    # X-Factor는 절댓값이므로 항상 양수
+    # 10) 임팩트 전 최대 크기(절댓값)/프레임, 임팩트 시 값 (평면별 통계)
+    # X-Factor는 음수/양수 부호를 유지하지만, 최대값은 절댓값 기준으로 계산
     stats: Dict[str, Dict[str, float]] = {}
     for name, xf in xf_by_plane.items():
         upto = max(min(impact_idx, len(xf) - 1), 0)
-        pre = xf[:upto+1]  # 절댓값이므로 abs() 제거
+        pre = xf[:upto+1]
         if pre.size == 0 or np.all(np.isnan(pre)):
             xf_max = np.nan; xf_max_frame = 0
         else:
-            xf_max = float(np.nanmax(pre))
-            xf_max_frame = int(np.nanargmax(pre))
+            # 절댓값 기준으로 최대값(크기) 찾기
+            abs_pre = np.abs(pre)
+            xf_max_abs = float(np.nanmax(abs_pre))
+            xf_max_frame = int(np.nanargmax(abs_pre))
+            # 해당 프레임의 실제 값(부호 포함)
+            xf_max = float(pre[xf_max_frame]) if xf_max_frame < len(pre) else xf_max_abs
         xf_at_impact = float(xf[impact_idx]) if 0 <= impact_idx < len(xf) else np.nan
         
         # DEBUG: impact frame의 xfactor 값이 NaN인지 확인
@@ -398,16 +410,17 @@ def compute_xfactor(df: pd.DataFrame) -> Dict[str, any]:
         }
 
     # 11) 최적 평면 자동 선택
-    # X-Factor는 절댓값이므로 0~180 범위에서 선택 (5~80은 실제로는 의미있는 X-Factor 범위)
+    # 절댓값 기준 중앙값이 5~80 범위에 있는 평면 중 IQR이 최소인 것 선택
     best_plane = None
     best_spread = None
     for name, xf in xf_by_plane.items():
         upto = max(min(impact_idx, len(xf) - 1), 0)
-        pre_vals = xf[:upto+1]  # 절댓값이므로 abs() 제거
+        pre_vals = xf[:upto+1]
         if pre_vals.size == 0 or np.all(np.isnan(pre_vals)):
             continue
-        q10, q90 = np.nanpercentile(pre_vals, [10, 90])
-        med = np.nanmedian(pre_vals)
+        abs_pre_vals = np.abs(pre_vals)
+        q10, q90 = np.nanpercentile(abs_pre_vals, [10, 90])
+        med = np.nanmedian(abs_pre_vals)
         if not (5 < med < 80):
             continue
         spread = q90 - q10
@@ -431,11 +444,13 @@ def compute_xfactor(df: pd.DataFrame) -> Dict[str, any]:
 def categorize_xfactor(deg: float) -> Dict[str, object]:
     """X-Factor 등급 및 코멘트 생성 (기준: 임팩트 전 최대값)
     
-    골프 X-Factor 정의: 상체(어깨) 회전각도 - 하체(골반) 회전각도 의 절댓값
-    - 항상 양수 범위: 0°~180°
-    - 이상적 범위: 약 25°–50° (일반적으로 45°가 최적)
+    골프 X-Factor 정의: 상체(어깨) 회전각도 - 하체(골반) 회전각도
+    - 음수: 왼쪽 회전 (counterclockwise rotation)
+    - 양수: 오른쪽 회전 (clockwise rotation)
+    - [-180°, 180°] 범위에서 방향 정보 유지
+    - 크기(절댓값) 기준으로 평가: 절댓값이 25°–50°가 이상적
     
-    구간:
+    구간 (크기 기준):
       - 0°–25° (낮음: 파워 손실)
       - 25°–45° (적정: 이상적)
       - 45°–50° (높음: 좋은 상태)
@@ -450,44 +465,49 @@ def categorize_xfactor(deg: float) -> Dict[str, object]:
             ]
         }
 
-    # 절댓값 기반 평가 (항상 양수이므로 deg = abs_deg)
+    # 크기(절댓값) 기준으로 평가, 부호는 회전 방향 표시
     abs_deg = abs(deg)
+    direction_label = "왼쪽(음수)" if deg < 0 else "오른쪽(양수)" if deg > 0 else "중립"
     
     if abs_deg < 25:
         return {
-            'range': f'{abs_deg:.1f}° (낮음)',
+            'range': f'{deg:.1f}° ({direction_label}, 낮음)',
             'label': '낮음',
             'messages': [
                 '상체와 하체의 회전 차이가 작아 파워 손실이 있습니다.',
+                f'현재 회전 방향은 {direction_label}입니다.',
                 '어깨 회전을 더 크게 가져가고, 골반은 상대적으로 덜 돌도록 연습해 보세요.',
                 '백스윙 시 상체가 골반보다 훨씬 더 많이 돌아가는 분리 회전을 의식하세요.'
             ]
         }
     elif 25 <= abs_deg <= 45:
         return {
-            'range': f'{abs_deg:.1f}° (적정)',
+            'range': f'{deg:.1f}° ({direction_label}, 적정)',
             'label': '적정',
             'messages': [
                 '이상적인 X-Factor 범위입니다. 상체·하체 분리 회전이 잘 이루어져 파워 전달이 효율적입니다.',
+                f'현재 회전 방향은 {direction_label}입니다.',
                 '현재의 회전 패턴을 유지하면서 일관성을 개선하는 것에 집중하세요.'
             ]
         }
     elif 45 < abs_deg <= 50:
         return {
-            'range': f'{abs_deg:.1f}° (높음)',
+            'range': f'{deg:.1f}° ({direction_label}, 높음)',
             'label': '높음',
             'messages': [
                 '충분한 꼬임으로 비거리 향상에 유리합니다.',
+                f'현재 회전 방향은 {direction_label}입니다.',
                 '다만 허리·코어의 부담이 커질 수 있으니 유연성 훈련을 병행하세요.',
                 '스윙 속도는 빠르지만 안정성을 잃지 않는 범위에서 진행하세요.'
             ]
         }
     else:  # abs_deg > 50
         return {
-            'range': f'{abs_deg:.1f}° (과도)',
+            'range': f'{deg:.1f}° ({direction_label}, 과도)',
             'label': '과도',
             'messages': [
                 '상체 꼬임이 과도하여 임팩트 타이밍이 흔들릴 수 있습니다.',
+                f'현재 회전 방향은 {direction_label}입니다.',
                 '백스윙을 조금 줄이거나 골반 회전을 더 늘려 적절한 분리 회전을 찾아보세요.',
                 '허리와 골반이 따로 노는 느낌이 강하면, 회전 범위를 조절해 안정감을 찾아보세요.',
                 '과도한 꼬임은 다운스윙에서 급한 풀림을 초래하여 임팩트 정확도를 해칠 수 있습니다.'

@@ -212,7 +212,62 @@ def smooth_df_2d(
     print(f"🎛️ 2D 스무딩 적용: method={method}, window={window}, alpha={alpha}")
     return out
 
-def vectorized_speed_m_s_3d(points_xyz: np.ndarray, fps: int, scale_to_m: float = 1.0) -> np.ndarray:
+def _filter_depth_outliers(z_coords: np.ndarray, verbose: bool = False) -> np.ndarray:
+    """
+    Z 좌표의 이상치를 필터링합니다 (depth 추적 오류 제거).
+    
+    방법: IQR (Interquartile Range) 기반 이상치 감지
+    - Q1/Q3 계산
+    - IQR = Q3 - Q1
+    - 이상치 범위: [Q1 - 1.5*IQR, Q3 + 1.5*IQR]
+    - 범위 밖의 값 → 보간으로 대체
+    
+    예시: Z 좌표가 [2200, 2300, ..., 6000 (이상!), ..., 2400]
+          이상치를 보간하여 부드러운 곡선으로 대체
+    """
+    z = z_coords.astype(float).copy()
+    
+    # 유효한 값 필터링
+    valid_mask = np.isfinite(z)
+    if not np.any(valid_mask):
+        return z
+    
+    valid_vals = z[valid_mask]
+    q1 = np.percentile(valid_vals, 25)
+    q3 = np.percentile(valid_vals, 75)
+    iqr = q3 - q1
+    
+    # 이상치 범위 정의
+    lower_bound = q1 - 1.5 * iqr
+    upper_bound = q3 + 1.5 * iqr
+    
+    # 이상치 마스크
+    outlier_mask = (z < lower_bound) | (z > upper_bound)
+    
+    if verbose:
+        n_outliers = np.sum(outlier_mask)
+        if n_outliers > 0:
+            outlier_indices = np.where(outlier_mask)[0]
+            print(f"[DEBUG] Z 좌표 이상치 감지: {n_outliers}개")
+            print(f"[DEBUG] IQR 범위: [{lower_bound:.1f}, {upper_bound:.1f}] mm")
+            print(f"[DEBUG] 이상치 프레임: {list(outlier_indices[:5])}{'...' if n_outliers > 5 else ''}")
+            print(f"[DEBUG] 이상치 값: {z[outlier_mask][:5]}")
+    
+    # 이상치를 NaN으로 마킹하여 보간
+    z[outlier_mask] = np.nan
+    
+    # 보간으로 NaN 채우기
+    z_series = pd.Series(z)
+    z_filtered = z_series.interpolate(method='linear', limit_direction='both').ffill().bfill().to_numpy()
+    
+    if verbose and np.sum(outlier_mask) > 0:
+        print(f"[DEBUG] ✅ 이상치를 보간으로 대체했습니다")
+    
+    return z_filtered
+
+
+def vectorized_speed_m_s_3d(points_xyz: np.ndarray, fps: int, scale_to_m: float = 1.0, 
+                            filter_z_outliers: bool = True) -> np.ndarray:
     """
     벡터화된 손목 3D 속도(m/s) 계산
     
@@ -223,21 +278,32 @@ def vectorized_speed_m_s_3d(points_xyz: np.ndarray, fps: int, scale_to_m: float 
       * 카메라 정규화 좌표: 1.0 (0.0002~0.0005 범위, 이미 m 단위)
       * mm 좌표: 0.001 (mm → m)
       * cm 좌표: 0.01 (cm → m)
+    - filter_z_outliers: True이면 depth 이상치(Z 좌표) 필터링
     
     정확한 계산 순서:
-    1. Δs = sqrt((Δx)^2 + (Δy)^2 + (Δz)^2) [좌표 원래 단위]
-    2. Δs_m = Δs * scale_to_m [m 단위로 변환]
-    3. v_m_s = Δs_m * fps [m/s]
+    1. Z 좌표 이상치 제거 (depth 추적 실패 처리)
+    2. Δs = sqrt((Δx)^2 + (Δy)^2 + (Δz)^2) [좌표 원래 단위]
+    3. Δs_m = Δs * scale_to_m [m 단위로 변환]
+    4. v_m_s = Δs_m * fps [m/s]
     
     반환: v_m_s 배열 (첫 번째 프레임은 0.0)
     """
     if points_xyz.ndim != 2 or points_xyz.shape[1] != 3:
         return np.full((len(points_xyz),), np.nan, dtype=float)
     X = points_xyz.astype(float).copy()
+    
+    # ⚠️ CRITICAL: Z 좌표 이상치 필터링 (depth 카메라 추적 오류 제거)
+    if filter_z_outliers:
+        print(f"[DEBUG] Z 좌표 이상치 필터링 시작...")
+        X[:, 2] = _filter_depth_outliers(X[:, 2], verbose=True)
+    
+    # 각 축별 보간 (결측치 채우기)
     for c in range(3):
         s = pd.Series(X[:, c])
         s = s.interpolate(limit_direction='both').ffill().bfill()
         X[:, c] = s.to_numpy()
+    
+    # 프레임 간 거리 계산
     dx = np.diff(X[:, 0], prepend=X[0, 0])
     dy = np.diff(X[:, 1], prepend=X[0, 1])
     dz = np.diff(X[:, 2], prepend=X[0, 2])
@@ -535,10 +601,54 @@ def analyze_wrist_speed_3d(df: pd.DataFrame, fps: int, wrist: str = "RWrist", sc
     wx = W[:, 0]
     stance_mid_x = (RA[:, 0] + LA[:, 0]) / 2.0
     
-    # 3D 손목 속도 (m/s)
-    v_m_s = vectorized_speed_m_s_3d(W, fps, scale_to_m=scale_to_m)
+    # 3D 손목 속도 (m/s) - Z좌표 이상치 필터링 포함
+    v_m_s = vectorized_speed_m_s_3d(W, fps, scale_to_m=scale_to_m, filter_z_outliers=True)
     print(f"[DEBUG] v_m_s 샘플 (처음 10프레임): {v_m_s[:10]}")
+    
+    # ⚠️ 추가 필터링: 프레임 간 속도가 비정상적으로 크면 제거
+    # 정상: 0~100 km/h, 비정상: 100+ km/h 프레임
     v_ms, v_kmh, v_mph = _speed_conversions_m_s(v_m_s)
+    
+    # 비정상적인 속도 스파이크 검출 (IQR 기반)
+    valid_speeds = v_kmh[np.isfinite(v_kmh)]
+    if len(valid_speeds) > 4:
+        q1 = np.percentile(valid_speeds, 25)
+        q3 = np.percentile(valid_speeds, 75)
+        iqr = q3 - q1
+        speed_upper_bound = q3 + 3.0 * iqr  # 3 sigma 수준
+        
+        # 비정상 속도 프레임 마킹
+        abnormal_mask = v_kmh > speed_upper_bound
+        n_abnormal = np.sum(abnormal_mask)
+        
+        if n_abnormal > 0:
+            abnormal_frames = np.where(abnormal_mask)[0]
+            print(f"[WARN] 비정상 속도 프레임 감지: {n_abnormal}개 (limit={speed_upper_bound:.1f} km/h)")
+            print(f"[WARN]   프레임: {list(abnormal_frames[:5])}{'...' if n_abnormal > 5 else ''}")
+            print(f"[WARN]   속도: {v_kmh[abnormal_mask][:5]} km/h")
+            
+            # 비정상 속도 프레임을 인접한 정상 속도로 보간
+            for idx in abnormal_frames:
+                # 양쪽에서 정상 값 찾기
+                left_val = None
+                right_val = None
+                for j in range(idx-1, -1, -1):
+                    if not abnormal_mask[j]:
+                        left_val = v_kmh[j]
+                        break
+                for j in range(idx+1, len(v_kmh)):
+                    if not abnormal_mask[j]:
+                        right_val = v_kmh[j]
+                        break
+                
+                # 평균으로 대체
+                if left_val is not None and right_val is not None:
+                    v_kmh[idx] = (left_val + right_val) / 2
+                    v_mph[idx] = v_kmh[idx] / 1.609344
+                    v_m_s[idx] = v_kmh[idx] / 3.6
+                    print(f"[DEBUG]   Frame {idx}: {v_kmh[idx]:.1f} km/h로 보간")
+    
+    print(f"[DEBUG] 필터링 후 v_m_s 샘플 (처음 10프레임): {v_m_s[:10]}")
     
     # 임팩트 프레임 탐지
     impact = detect_impact_by_crossing(wx, stance_mid_x)
@@ -672,15 +782,18 @@ def load_cfg(p: Path):
 def _coord_scale_to_m(cfg: dict) -> float:
     """분석 설정에서 좌표 단위 → 미터 환산 스케일을 결정합니다.
     
-    우선순위:
-    1. intrinsics.json의 depth_scale (있으면 우선 사용)
-    2. analyze.yaml의 coord_unit 명시 설정
-    3. wide3 데이터로부터 자동 감지 (좌표 범위 기반)
-    4. 기본값: 1.0 (m로 간주)
+    우선순위 (높을수록 신뢰도 높음):
+    1. intrinsics.json의 depth_scale (controller.py가 저장한 메타정보, 가장 신뢰도 높음)
+    2. analyze.yaml의 명시적 coord_unit 설정
+    3. wide3 데이터 범위로부터 자동 감지
+    4. 기본값: 0.001 (MM 단위로 간주, 대부분의 3D depth 카메라가 MM 저장)
     
     지원 단위: m, cm, mm (대소문자 무시)
+    
+    ⚠️ 중요: controller.py의 3D 처리 결과는 MM 단위로 저장되므로,
+            intrinsics에 depth_scale이 없더라도 기본값은 0.001이어야 합니다.
     """
-    # 1단계: intrinsics.json에서 depth_scale 확인 (3D ZIP으로 전달된 메타정보)
+    # 1단계: intrinsics.json의 depth_scale (가장 신뢰도 높음)
     if 'intrinsics' in cfg and isinstance(cfg['intrinsics'], dict):
         meta = cfg['intrinsics'].get('meta', {})
         if isinstance(meta, dict):
@@ -689,52 +802,37 @@ def _coord_scale_to_m(cfg: dict) -> float:
                 try:
                     scale = float(depth_scale)
                     if scale > 0:
-                        print(f"[INFO] intrinsics.json depth_scale 사용: {scale:.6f} (m/unit)")
+                        print(f"[INFO] ✅ LEVEL 1: intrinsics.depth_scale 사용: {scale:.6f} (m/unit)")
                         return scale
                 except (TypeError, ValueError):
                     pass
     
-    # 2단계: analyze.yaml의 coord_unit 명시 설정 (선택적, wide3이 있으면 skip)
-    if 'wide3' not in cfg:  # wide3이 없을 때만 coord_unit 사용
-        unit = (cfg.get("coord_unit", "m") or "m").strip().lower()
-        
-        if unit in ("m", "meter", "metre", "meters"):
-            print(f"[INFO] coord_unit='m' 사용 → scale_to_m=1.0")
-            return 1.0
-        if unit in ("cm", "centimeter", "centimetre", "centimeters"):
-            print(f"[INFO] coord_unit='cm' 사용 → scale_to_m=0.01")
-            return 1e-2
-        if unit in ("mm", "millimeter", "millimetre", "millimeters"):
-            print(f"[INFO] coord_unit='mm' 사용 → scale_to_m=0.001")
-            return 1e-3
-    
-    # 2.5단계: intrinsics에서 depth_scale 확인
-    # controller.py가 CSV에 저장한 좌표는 MM 단위이므로, depth_scale이 있으면 MM 좌표로 간주
-    try:
-        intrinsics = cfg.get('intrinsics')
-        if intrinsics and isinstance(intrinsics, dict):
-            meta = intrinsics.get('meta', {})
-            depth_scale = meta.get('depth_scale')
-            if depth_scale and 0.0001 <= float(depth_scale) <= 0.01:
-                # depth_scale이 0.001 정도이면 원본 depth가 MM이고,
-                # controller에서 CSV에 MM 단위로 저장했다는 뜻
-                print(f"[DEBUG] intrinsics 감지: depth_scale={depth_scale} → CSV 좌표는 MM 단위")
-                print(f"[INFO] 🎯 intrinsics depth_scale 감지 → scale_to_m=0.001 (CSV가 MM 단위)")
+    # 2단계: analyze.yaml의 coord_unit 명시 설정
+    # (coord_unit이 명시되어 있으면 자동 감지보다 우선)
+    if 'coord_unit' in cfg:
+        unit = (cfg.get("coord_unit") or "").strip().lower()
+        if unit:
+            if unit in ("m", "meter", "metre", "meters"):
+                print(f"[INFO] ✅ LEVEL 2a: coord_unit='m' → scale_to_m=1.0")
+                return 1.0
+            if unit in ("cm", "centimeter", "centimetre", "centimeters"):
+                print(f"[INFO] ✅ LEVEL 2b: coord_unit='cm' → scale_to_m=0.01")
+                return 1e-2
+            if unit in ("mm", "millimeter", "millimetre", "millimeters"):
+                print(f"[INFO] ✅ LEVEL 2c: coord_unit='mm' → scale_to_m=0.001")
                 return 1e-3
-    except Exception as e:
-        print(f"[DEBUG] intrinsics 확인 실패: {e}")
     
-    # 3단계: wide3 데이터로부터 자동 감지 (좌표 범위 기반)
+    # 3단계: wide3 데이터 범위로부터 자동 감지
     try:
         wide3 = cfg.get("wide3")
         if wide3 is not None and hasattr(wide3, 'columns'):
-            # 3D 컬럼 찾기 (대소문자 무시, X3D/Y3D/Z3D 또는 __x/__y/__z 또는 _x/_y/_z 패턴)
+            # 3D 컬럼 찾기 (X3D/Y3D/Z3D 등 패턴)
             coord_cols = [c for c in wide3.columns if any(
                 x.lower() in c.lower() for x in ('x3d', 'y3d', 'z3d', '__x', '__y', '__z', '_x', '_y', '_z')
             ) and (c.lower().endswith(('x3d', 'y3d', 'z3d', '__x', '__y', '__z', '_x', '_y', '_z')))]
             
             if coord_cols:
-                print(f"[DEBUG] 감지된 3D 컬럼: {coord_cols[:5]}... (총 {len(coord_cols)}개)")
+                print(f"[DEBUG] LEVEL 3: 감지된 3D 컬럼: {coord_cols[:3]}... (총 {len(coord_cols)}개)")
                 all_vals = []
                 for col in coord_cols:
                     try:
@@ -747,44 +845,50 @@ def _coord_scale_to_m(cfg: dict) -> float:
                 if all_vals:
                     max_val = float(max(all_vals))
                     min_val = float(min([v for v in all_vals if v > 0]))
-                    print(f"[DEBUG] 자동 감지: 3D 좌표 범위 = [{min_val:.9f}, {max_val:.6f}]")
+                    print(f"[DEBUG]   좌표 범위: [{min_val:.9f}, {max_val:.6f}]")
                     
-                    # Heuristic으로 단위 판정
-                    # 1) 카메라 정규화: 0.0001 ~ 0.001 범위
-                    # 2) MM 단위 (controller 저장): 100 ~ 3000 범위
-                    # 3) m 단위: 0.1 ~ 10 범위
-                    # 4) CM 단위 또는 평활화된 좌표: 0.1 ~ 500 범위
-                    
+                    # Heuristic 판정 (더 신뢰도 높은 순서)
+                    # 카메라 정규화 좌표: 0.0001 ~ 0.001 범위 (이미 m)
                     if min_val >= 0.0001 and max_val < 0.001:
-                        print(f"[INFO] 🎯 카메라 정규화 좌표 감지 → scale_to_m=1.0 (이미 m 단위)")
+                        print(f"[INFO] 🎯 LEVEL 3a: 카메라 정규화 좌표 → scale_to_m=1.0")
                         return 1.0
-                    elif max_val >= 100:
-                        # 100 이상이면 MM 범위로 간주 (카메라 이미지 크기 기반)
-                        print(f"[INFO] 🎯 MM 범위 좌표 감지 (max={max_val:.2f}) → scale_to_m=0.001 (MM→m 변환)")
+                    
+                    # MM 단위 (controller 저장): 50 이상이면 MM 범위로 강하게 간주
+                    # ⚠️ 신뢰도 높음: depth 카메라가 항상 MM 저장
+                    elif max_val >= 50:
+                        print(f"[INFO] 🎯 LEVEL 3b: MM 범위 좌표 (max={max_val:.2f}) → scale_to_m=0.001")
                         return 1e-3
+                    
+                    # m 범위: 1 ~ 10
                     elif min_val >= 1 and max_val <= 10:
-                        print(f"[INFO] 🎯 m 범위 좌표 감지 → scale_to_m=1.0 (이미 m 단위)")
+                        print(f"[INFO] 🎯 LEVEL 3c: m 범위 좌표 → scale_to_m=1.0")
                         return 1.0
-                    elif min_val >= 0.1 and max_val < 100:
-                        # Smoothing이나 변환 후 스케일 (0.1~100 범위)
-                        print(f"[INFO] 🎯 평활화/변환된 좌표 범위 감지 [{min_val:.2f}, {max_val:.2f}]")
-                        # max_val 기반으로 판정: 
-                        # - max < 50: CM 또는 m 범위 → 0.01 (cm) 또는 1.0 (m)
-                        # - max >= 50: MM/10 스케일 → 0.001
-                        if max_val >= 50:
-                            print(f"[INFO]    → scale_to_m=0.001 (MM → m 변환)")
-                            return 0.001
-                        else:
-                            print(f"[INFO]    → scale_to_m=0.01 (CM 또는 평활화 좌표 → m 변환)")
+                    
+                    # 평활화/변환된 좌표: 0.1 ~ 50
+                    elif min_val >= 0.1 and max_val < 50:
+                        print(f"[DEBUG]   평활화 좌표 범위 [{min_val:.2f}, {max_val:.2f}]")
+                        # 30 이상이면 MM/10 스케일
+                        if max_val >= 30:
+                            print(f"[INFO] 🎯 LEVEL 3d: MM/10 스케일 → scale_to_m=0.0001")
+                            return 0.0001
+                        # 10 이상 30 미만이면 CM 또는 평활화된 m
+                        elif max_val >= 10:
+                            print(f"[INFO] 🎯 LEVEL 3e: CM 범위 → scale_to_m=0.01")
                             return 0.01
+                        else:
+                            print(f"[INFO] 🎯 LEVEL 3f: m 범위 → scale_to_m=1.0")
+                            return 1.0
+                    
+                    print(f"[WARN] 범위 판정 실패 [{min_val:.6f}, {max_val:.6f}], 기본값 MM 단위 적용")
             else:
-                print(f"[DEBUG] 3D 컬럼을 찾을 수 없음. 존재하는 컬럼: {list(wide3.columns)[:10]}")
+                print(f"[DEBUG] 3D 컬럼 없음. 컬럼 샘플: {list(wide3.columns)[:5]}")
     except Exception as e:
-        print(f"[WARN] 자동 감지 실패: {e}")
+        print(f"[DEBUG] 자동 감지 오류: {e}")
     
-    # 최종 기본값
-    print(f"[WARN] 좌표 단위를 확정할 수 없음, m로 간주합니다 (scale_to_m=1.0)")
-    return 1.0
+    # ⚠️ 최종 기본값: 0.001 (MM 단위)
+    # 대부분의 3D depth 카메라와 controller.py의 처리 결과가 MM 저장하므로
+    print(f"[WARN] 좌표 단위 미결정 → 기본값 MM 단위 적용 (scale_to_m=0.001)")
+    return 1e-3
 
 # =========================================================
 # Swing Speed 전용 계산 함수
@@ -1108,20 +1212,33 @@ def run_from_context(ctx: dict):
                     ctx_for_scale = dict(ctx)
                     ctx_for_scale['wide3'] = use_df
                     
-                    # intrinsics 정보 전달 (depth_scale 등 메타데이터 포함)
-                    print(f"[DEBUG] run_from_context: 'intrinsics' in ctx = {'intrinsics' in ctx}")
+                    # intrinsics 정보 전달 (depth_scale 등 메타데이터 포함) - CRITICAL FOR CORRECT SCALING
+                    print(f"\n[🔍 SCALE DETECTION START] 'intrinsics' in ctx = {'intrinsics' in ctx}")
                     if 'intrinsics' in ctx:
                         print(f"[DEBUG] intrinsics type = {type(ctx['intrinsics'])}")
-                        print(f"[DEBUG] intrinsics keys = {list(ctx['intrinsics'].keys()) if isinstance(ctx['intrinsics'], dict) else 'N/A'}")
+                        if isinstance(ctx['intrinsics'], dict):
+                            print(f"[DEBUG] intrinsics keys = {list(ctx['intrinsics'].keys())}")
+                            meta = ctx['intrinsics'].get('meta', {})
+                            if meta:
+                                print(f"[DEBUG] intrinsics.meta keys = {list(meta.keys())}")
+                                depth_scale = meta.get('depth_scale')
+                                print(f"[DEBUG] ✅ intrinsics.meta.depth_scale = {depth_scale}")
                     
                     if 'intrinsics' in ctx and isinstance(ctx['intrinsics'], dict):
                         ctx_for_scale['intrinsics'] = ctx['intrinsics']
-                        print(f"[DEBUG] intrinsics 추가됨: {ctx['intrinsics'].get('meta', {}).get('depth_scale', 'NOT FOUND')}")
+                        print(f"[DEBUG] ✅ intrinsics added to ctx_for_scale")
                     else:
-                        print(f"[DEBUG] intrinsics 미포함 또는 dict 아님")
+                        print(f"[WARN] ❌ intrinsics NOT added (missing or not dict)")
+                        print(f"[WARN]    Falling back to auto-detection from wide3 data range")
                     
                     scale_to_m = _coord_scale_to_m(ctx_for_scale)
-                    print(f"[DEBUG] scale_to_m 결정됨: {scale_to_m}")
+                    print(f"[✅ SCALE DECISION] Final scale_to_m = {scale_to_m}")
+                    print(f"[INFO] 이를 적용하면: 1 unit = {scale_to_m * 1000:.3f} mm")
+                    if scale_to_m == 0.001:
+                        print(f"[INFO] → 좌표가 MM 단위이고, 올바른 스케일입니다")
+                    elif scale_to_m == 1.0:
+                        print(f"[WARN] → 좌표가 M 단위로 간주됩니다 (검증 필요)")
+                    print(f"[🔍 SCALE DETECTION END]\n")
                     
                     anal = analyze_wrist_speed_3d(use_df, fps=fps, wrist=wrist_r, scale_to_m=scale_to_m)
                     # 메트릭 CSV 구성 (프레임별 m/s, km/h, mph)
