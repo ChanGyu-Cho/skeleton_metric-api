@@ -215,51 +215,62 @@ def _filter_depth_outliers(z_coords: np.ndarray, verbose: bool = False) -> np.nd
     """
     Z 좌표의 이상치를 필터링합니다 (depth 추적 오류 제거).
     
-    두 단계 필터링:
-    1. 절대값 임계값: 골프 스윙 범위(0.5m~3.0m) 벗어나는 값 제거
-    2. IQR 기반: 나머지에서 ±2.5 IQR 벗어나는 값 제거
+    세 단계 필터링:
+    1. 절대값 범위: 시연 환경 기준 0.5m~2.5m 벗어나면 제거
+    2. 급격한 점프: 프레임간 1.5m 이상 변화시 제거
+    3. IQR 기반: ±2.5 IQR 벗어나는 값 제거
     """
     z = z_coords.astype(float).copy()
     valid_mask = np.isfinite(z)
     if not np.any(valid_mask):
         return z
 
-    # 1단계: 절대값 임계값 (골프 스윙 물리적 범위)
-    DEPTH_MIN = 0.3  # 카메라 너무 가까움
-    DEPTH_MAX = 4.0  # 카메라로부터 4m 이상은 비정상
+    # 1단계: 절대값 범위 (시연 환경 물리적 제약)
+    DEPTH_MIN = 0.5  # 0.5m 이하는 너무 가까움
+    DEPTH_MAX = 3.0  # 극단적인 이상치만 제거 (2.0m은 너무 공격적)
     abs_outlier_mask = (z < DEPTH_MIN) | (z > DEPTH_MAX)
     z[abs_outlier_mask] = np.nan
+    n_abs_outliers = np.sum(abs_outlier_mask)
     
-    # 2단계: IQR 기반 (남은 유효값 중 통계적 이상치)
+    # 2단계: 급격한 점프 감지 (프레임간 연속성)
+    dz = np.abs(np.diff(z, prepend=z[0]))
+    JUMP_THRESHOLD = 1.5  # 60fps 기준 프레임간 1.5m 이상 변화는 비정상
+    jump_mask = (dz > JUMP_THRESHOLD) & np.isfinite(z)
+    z[jump_mask] = np.nan
+    n_jump_outliers = np.sum(jump_mask)
+    
+    # 3단계: IQR 기반 (남은 유효값 중 통계적 이상치)
     valid_mask = np.isfinite(z)
     if not np.any(valid_mask):
         return z
     
     valid_vals = z[valid_mask]
+    if len(valid_vals) < 4:  # IQR 계산 불가능
+        return z
+        
     q1 = np.percentile(valid_vals, 25)
     q3 = np.percentile(valid_vals, 75)
     iqr = q3 - q1
-    lower_bound = q1 - 2.5 * iqr  # 3.0 → 2.5로 강화
+    lower_bound = q1 - 2.5 * iqr
     upper_bound = q3 + 2.5 * iqr
     outlier_mask = (z < lower_bound) | (z > upper_bound)
+    n_iqr_outliers = np.sum(outlier_mask & np.isfinite(z))
 
-    if verbose:
-        n_abs_outliers = np.sum(abs_outlier_mask)
-        n_iqr_outliers = np.sum(outlier_mask & np.isfinite(z))
-        if n_abs_outliers > 0 or n_iqr_outliers > 0:
-            print(f"[DEBUG] 절대값 이상치: {n_abs_outliers}개 (범위: {DEPTH_MIN}-{DEPTH_MAX}m)")
-            print(f"[DEBUG] IQR 이상치: {n_iqr_outliers}개 (범위: [{lower_bound:.2f}, {upper_bound:.2f}]m)")
-            if n_abs_outliers > 0:
-                abs_indices = np.where(abs_outlier_mask)[0]
-                print(f"[DEBUG] 절대값 이상 프레임: {list(abs_indices[:10])}")
-            if n_iqr_outliers > 0:
-                iqr_indices = np.where(outlier_mask & np.isfinite(z))[0]
-                print(f"[DEBUG] IQR 이상 프레임: {list(iqr_indices[:10])}")
+    if verbose and (n_abs_outliers > 0 or n_jump_outliers > 0 or n_iqr_outliers > 0):
+        print(f"[DEBUG] 절대값 범위 이상치: {n_abs_outliers}개 (허용: {DEPTH_MIN}-{DEPTH_MAX}m)")
+        print(f"[DEBUG] 급격한 점프 이상치: {n_jump_outliers}개 (임계값: {JUMP_THRESHOLD}m)")
+        print(f"[DEBUG] IQR 통계 이상치: {n_iqr_outliers}개 (범위: [{lower_bound:.2f}, {upper_bound:.2f}]m)")
+        if n_abs_outliers > 0:
+            abs_indices = np.where(abs_outlier_mask)[0]
+            print(f"[DEBUG] 범위 초과 프레임: {list(abs_indices[:10])}")
+        if n_jump_outliers > 0:
+            jump_indices = np.where(jump_mask)[0]
+            print(f"[DEBUG] 점프 이상 프레임: {list(jump_indices[:10])}")
 
     z[outlier_mask] = np.nan
-    z_series = pd.Series(z)
-    z_filtered = z_series.interpolate(method='linear', limit_direction='both').ffill().bfill().to_numpy()
-    return z_filtered
+    # CRITICAL: Do NOT interpolate here - already done in controller.py and vectorized_speed_m_s_3d
+    # Multiple interpolations spread outliers to neighboring frames
+    return z
 
 
 def vectorized_speed_m_s_3d(points_xyz: np.ndarray, fps: int, scale_to_m: float = 1.0,
@@ -273,10 +284,10 @@ def vectorized_speed_m_s_3d(points_xyz: np.ndarray, fps: int, scale_to_m: float 
     X = points_xyz.astype(float).copy()
 
     if filter_z_outliers:
-        print(f"[DEBUG] XYZ 좌표 이상치 필터링 시작...")
-        for axis in range(3):
-            X[:, axis] = _filter_depth_outliers(X[:, axis], verbose=True)  # verbose=True로 변경
+        print(f"[DEBUG] Z축(깊이) 이상치 필터링 시작...")
+        X[:, 2] = _filter_depth_outliers(X[:, 2], verbose=True)  # Z축만 필터링
 
+    # CRITICAL: Single interpolation pass AFTER outlier filtering (not before, not in _filter_depth_outliers)
     for c in range(3):
         s = pd.Series(X[:, c])
         s = s.interpolate(limit_direction='both').ffill().bfill()
