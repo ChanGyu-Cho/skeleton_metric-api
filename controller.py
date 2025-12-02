@@ -1165,6 +1165,8 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
                                     
                                     # CSV에 저장할 때는 미터 단위 (swing_speed.py에서 scale_to_m=1.0으로 처리)
                                     sample_info['Z_median'] = None if np.isnan(Z_meter) else float(Z_meter)
+                                    # Store Z in meters for output row
+                                    Zm = sample_info['Z_median'] if sample_info['Z_median'] is not None else np.nan
                                     
                                     # [DEBUG] 처음 5프레임만 로그 출력
                                     if frame_idx < 5:
@@ -1201,7 +1203,7 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
                             # [DEBUG] 모든 데이터에 대해 결과 기록
                             x_val = float(X) if not np.isnan(X) else np.nan
                             y_val = float(Y) if not np.isnan(Y) else np.nan
-                            z_val = float(Zm) if (not np.isnan(Zm) and Zm is not None and np.isfinite(Zm)) else np.nan
+                            z_val = float(Zm) if (Zm is not None and np.isfinite(Zm)) else np.nan
                             
                             rows.append({
                                 'frame': frame_idx,
