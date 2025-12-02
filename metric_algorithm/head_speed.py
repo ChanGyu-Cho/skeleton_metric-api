@@ -41,6 +41,7 @@ import sys
 from pathlib import Path
 sys.path.append(str(Path(__file__).parent))
 from utils_io import natural_key, ensure_dir
+from impact_utils import detect_impact_by_crossing, compute_stance_mid_and_width
 from runner_utils import (
     parse_joint_axis_map_from_columns,
     is_dataframe_3d,
@@ -310,7 +311,7 @@ def compute_head_movement_preimpact(df: pd.DataFrame, head_joint: str = "Nose", 
     - 머리 대표: Nose (3D x,y 사용)
     - 기준 프레임: 0 (어드레스)
     - 스탠스 중앙: stance_mid_x = (RAnkle_x + LAnkle_x)/2 (프레임별)
-    - 손목 선택: 후반부 X 추세(slope)가 더 +인 손목을 선택
+    - 손목 선택: 후반부 X 추세(slope)가 더 +인 손목을 선택 (impact_utils 사용)
     - 임팩트: 스윙 초반 20% 건너뛰고, Wrist_X >= stance_mid_x and ΔWrist_X>0 최초 프레임
     - 임팩트 전 구간에서 머리 총 변위(max, RMS) 계산
     - 정규화: 스탠스 폭 중앙값(|RAnkle_x - LAnkle_x|의 median)로 나눠 %
@@ -327,11 +328,7 @@ def compute_head_movement_preimpact(df: pd.DataFrame, head_joint: str = "Nose", 
     # 3D 축 시계열 (z가 없어도 x,y만으로 동작)
     nose_x = _get_axis_series(df, head_joint, 'x', prefer_2d=False).to_numpy()
     nose_y = _get_axis_series(df, head_joint, 'y', prefer_2d=False).to_numpy()
-    la_x = _get_axis_series(df, 'LAnkle', 'x', prefer_2d=False).to_numpy()
-    ra_x = _get_axis_series(df, 'RAnkle', 'x', prefer_2d=False).to_numpy()
-    lw_x = _get_axis_series(df, 'LWrist', 'x', prefer_2d=False).to_numpy()
-    rw_x = _get_axis_series(df, 'RWrist', 'x', prefer_2d=False).to_numpy()
-
+    
     # 기준 프레임(0) 좌표
     x0 = nose_x[0] if not np.isnan(nose_x[0]) else np.nan
     y0 = nose_y[0] if not np.isnan(nose_y[0]) else np.nan
@@ -341,46 +338,16 @@ def compute_head_movement_preimpact(df: pd.DataFrame, head_joint: str = "Nose", 
     head_dy = nose_y - y0
     head_disp = np.sqrt(head_dx**2 + head_dy**2)
 
-    # 스탠스 중앙 및 폭
-    stance_mid_x = (ra_x + la_x) / 2.0
+    # 스탠스 중앙 및 폭 계산 + 임팩트 탐지 (COM 기반 정확한 방식)
+    from impact_utils import detect_impact_by_crossing as detect_impact_com, compute_stance_mid_and_width
+    stance_mid_x, stance_width_med = compute_stance_mid_and_width(df, prefer_2d=False)
+    impact = detect_impact_com(df, prefer_2d=False, skip_ratio=0.0, smooth_window=3, hold_frames=0, margin=0.0)
+    
+    # 스탠스 폭 (임팩트 계산과 동일)
+    la_x = _get_axis_series(df, 'LAnkle', 'x', prefer_2d=False).to_numpy()
+    ra_x = _get_axis_series(df, 'RAnkle', 'x', prefer_2d=False).to_numpy()
     stance_width = np.abs(ra_x - la_x)
     stance_width_med = _median_ignore_nan(stance_width)
-
-    # 손목 선택: 후반부(예: 50%~100%) 구간에서 선형 추세 기울기 비교
-    start_slope = int(N * max(skip_ratio, 0.2))
-    start_slope = min(start_slope, max(N - 3, 0))
-    xs = np.arange(start_slope, N, dtype=float)
-    def slope_of(arr):
-        yy = arr[start_slope:]
-        if len(xs) != len(yy) or len(yy) < 2:
-            return np.nan
-        # NaN 처리: 선형 보간 후 회귀
-        yy2 = pd.Series(yy).interpolate(limit_direction='both').to_numpy()
-        try:
-            k, b = np.polyfit(xs, yy2, 1)
-            return float(k)
-        except Exception:
-            return np.nan
-    slope_L = slope_of(lw_x)
-    slope_R = slope_of(rw_x)
-    selected_wrist = 'RWrist' if (np.nan_to_num(slope_R, nan=-1e9) >= np.nan_to_num(slope_L, nan=-1e9)) else 'LWrist'
-    wrist_x = rw_x if selected_wrist == 'RWrist' else lw_x
-
-    # 임팩트 프레임 탐지
-    start = int(N * max(skip_ratio, 0.2))
-    impact = -1
-    for i in range(max(1, start), N):
-        if np.isnan(wrist_x[i]) or np.isnan(wrist_x[i-1]) or np.isnan(stance_mid_x[i]):
-            continue
-        cond_cross = wrist_x[i] >= stance_mid_x[i]
-        cond_vel = (wrist_x[i] - wrist_x[i-1]) > 0
-        if cond_cross and cond_vel:
-            impact = i
-            break
-    if impact == -1:
-        # fallback: 손목 X가 최대인 프레임
-        with np.errstate(invalid='ignore'):
-            impact = int(np.nanargmax(wrist_x)) if np.any(~np.isnan(wrist_x)) else N-1
 
     # 임팩트 전 구간 변위 통계
     upto = max(min(impact, N-1), 0)
@@ -424,7 +391,6 @@ def compute_head_movement_preimpact(df: pd.DataFrame, head_joint: str = "Nose", 
         'head_dy': head_dy,
         'head_disp': head_disp,
         'head_disp_pct': head_disp_pct,
-        'selected_wrist': selected_wrist,
     }
 
 def compute_head_movement_preimpact_2d(df: pd.DataFrame, head_joint: str = "Nose", skip_ratio: float = 0.2):
@@ -444,11 +410,7 @@ def compute_head_movement_preimpact_2d(df: pd.DataFrame, head_joint: str = "Nose
 
     nose_x = _get_axis_series(df, head_joint, 'x', prefer_2d=True).to_numpy()
     nose_y = _get_axis_series(df, head_joint, 'y', prefer_2d=True).to_numpy()
-    la_x = _get_axis_series(df, 'LAnkle', 'x', prefer_2d=True).to_numpy()
-    ra_x = _get_axis_series(df, 'RAnkle', 'x', prefer_2d=True).to_numpy()
-    lw_x = _get_axis_series(df, 'LWrist', 'x', prefer_2d=True).to_numpy()
-    rw_x = _get_axis_series(df, 'RWrist', 'x', prefer_2d=True).to_numpy()
-
+    
     x0 = nose_x[0] if not np.isnan(nose_x[0]) else np.nan
     y0 = nose_y[0] if not np.isnan(nose_y[0]) else np.nan
 
@@ -456,42 +418,12 @@ def compute_head_movement_preimpact_2d(df: pd.DataFrame, head_joint: str = "Nose
     head_dy = nose_y - y0
     head_disp = np.sqrt(head_dx**2 + head_dy**2)
 
-    stance_mid_x = (ra_x + la_x) / 2.0
-    stance_width = np.abs(ra_x - la_x)
-    stance_width_med = _median_ignore_nan(stance_width)
+    # 스탠스 중앙 및 폭 계산 + 임팩트 탐지 (COM 기반 정확한 방식, 2D)
+    from impact_utils import detect_impact_by_crossing as detect_impact_com, compute_stance_mid_and_width
+    stance_mid_x, stance_width_med = compute_stance_mid_and_width(df, prefer_2d=True)
+    impact = detect_impact_com(df, prefer_2d=True, skip_ratio=0.0, smooth_window=3, hold_frames=0, margin=0.0)
 
-    start_slope = int(N * max(skip_ratio, 0.2))
-    start_slope = min(start_slope, max(N - 3, 0))
-    xs = np.arange(start_slope, N, dtype=float)
-    def slope_of(arr):
-        yy = arr[start_slope:]
-        if len(xs) != len(yy) or len(yy) < 2:
-            return np.nan
-        yy2 = pd.Series(yy).interpolate(limit_direction='both').to_numpy()
-        try:
-            k, b = np.polyfit(xs, yy2, 1)
-            return float(k)
-        except Exception:
-            return np.nan
-    slope_L = slope_of(lw_x)
-    slope_R = slope_of(rw_x)
-    selected_wrist = 'RWrist' if (np.nan_to_num(slope_R, nan=-1e9) >= np.nan_to_num(slope_L, nan=-1e9)) else 'LWrist'
-    wrist_x = rw_x if selected_wrist == 'RWrist' else lw_x
-
-    start = int(N * max(skip_ratio, 0.2))
-    impact = -1
-    for i in range(max(1, start), N):
-        if np.isnan(wrist_x[i]) or np.isnan(wrist_x[i-1]) or np.isnan(stance_mid_x[i]):
-            continue
-        cond_cross = wrist_x[i] >= stance_mid_x[i]
-        cond_vel = (wrist_x[i] - wrist_x[i-1]) > 0
-        if cond_cross and cond_vel:
-            impact = i
-            break
-    if impact == -1:
-        with np.errstate(invalid='ignore'):
-            impact = int(np.nanargmax(wrist_x)) if np.any(~np.isnan(wrist_x)) else N-1
-
+    # 임팩트 전 구간 변위 통계
     upto = max(min(impact, N-1), 0)
     seg = head_disp[:upto+1]
     if np.all(np.isnan(seg)):
@@ -531,7 +463,6 @@ def compute_head_movement_preimpact_2d(df: pd.DataFrame, head_joint: str = "Nose
         'head_dy': head_dy,
         'head_disp': head_disp,
         'head_disp_pct': head_disp_pct,
-        'selected_wrist': selected_wrist,
     }
 def compute_head_speed_3d(df: pd.DataFrame, landmark: str, fps=None):
     """

@@ -30,6 +30,7 @@ import sys
 from pathlib import Path
 sys.path.append(str(Path(__file__).parent))
 from utils_io import natural_key, ensure_dir
+from impact_utils import detect_impact_by_crossing, compute_stance_mid_and_width as compute_stance_utils
 from runner_utils import (
     parse_joint_axis_map_from_columns,
     is_dataframe_3d,
@@ -332,22 +333,7 @@ def _speed_conversions_m_s(v_m_s: np.ndarray):
     v_mph = v_m_s * 2.237  # 정확한 값: 3.6 / 1.609344
     return v_m_s, v_kmh, v_mph
 
-def detect_impact_by_crossing(wrist_x: np.ndarray, stance_mid_x: np.ndarray) -> int:
-    """X 증가(+) 방향으로 스탠스 중앙을 넘는 첫 프레임을 임팩트로 탐지"""
-    N = len(wrist_x)
-    impact = -1
-    for i in range(1, N):
-        if np.isnan(wrist_x[i]) or np.isnan(wrist_x[i-1]) or np.isnan(stance_mid_x[i]) or np.isnan(stance_mid_x[i-1]):
-            continue
-        crossed = (wrist_x[i-1] < stance_mid_x[i-1]) and (wrist_x[i] >= stance_mid_x[i])
-        positive_dx = (wrist_x[i] - wrist_x[i-1]) > 0
-        if crossed and positive_dx:
-            impact = i
-            break
-    if impact == -1:
-        with np.errstate(invalid='ignore'):
-            impact = int(np.nanargmax(wrist_x)) if np.any(~np.isnan(wrist_x)) else N-1
-    return impact
+
 
 def is_dataframe_3d(df: pd.DataFrame) -> bool:
     """데이터프레임에 Z 축 좌표가 존재하는지 검사하여 3D 여부 판정"""
@@ -650,8 +636,9 @@ def analyze_wrist_speed_3d(df: pd.DataFrame, fps: int, wrist: str = "RWrist", sc
     
     print(f"[DEBUG] 필터링 후 v_m_s 샘플 (처음 10프레임): {v_m_s[:10]}")
     
-    # 임팩트 프레임 탐지
-    impact = detect_impact_by_crossing(wx, stance_mid_x)
+    # 임팩트 프레임 탐지 (COM 기반 정확한 방식: RWrist X가 스탠스 중심을 +방향으로 교차)
+    from impact_utils import detect_impact_by_crossing as detect_impact_com
+    impact = detect_impact_com(df, prefer_2d=False, skip_ratio=0.0, smooth_window=3, hold_frames=0, margin=0.0)
     
     # ±2 프레임 내 피크 속도
     lo = max(0, impact - 2)
@@ -703,8 +690,9 @@ def analyze_wrist_speed_2d(df: pd.DataFrame, fps: int, wrist: str = "RWrist", m_
     # 2D 손목 속도 (px/s)
     v_px_s, unit = speed_2d(W, fps)
     
-    # 임팩트 프레임 탐지 (2D)
-    impact = detect_impact_by_crossing(wx, stance_mid_x)
+    # 임팩트 프레임 탐지 (COM 기반 정확한 방식: RWrist X가 스탠스 중심을 +방향으로 교차)
+    from impact_utils import detect_impact_by_crossing as detect_impact_com
+    impact = detect_impact_com(df, prefer_2d=True, skip_ratio=0.0, smooth_window=3, hold_frames=0, margin=0.0)
     
     # ±2 프레임 내 피크 속도
     lo = max(0, impact - 2)

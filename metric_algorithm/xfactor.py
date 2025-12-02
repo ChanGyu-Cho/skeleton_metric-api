@@ -47,6 +47,7 @@ except ImportError:
 import sys
 sys.path.append(str(Path(__file__).parent))
 from utils_io import natural_key, ensure_dir
+from impact_utils import detect_impact_by_crossing, compute_stance_mid_and_width
 from runner_utils import (
     parse_joint_axis_map_from_columns,
     is_dataframe_3d,
@@ -312,19 +313,6 @@ def smooth_median_then_moving(x: np.ndarray, w: int = 5) -> np.ndarray:
     sm = med.rolling(w, center=True, min_periods=1).mean()
     return sm.to_numpy()
 
-def detect_impact_by_crossing(df: pd.DataFrame) -> int:
-    RW = get_xyz_cols(df, 'RWrist'); rW = RW[:, 0]
-    RA = get_xyz_cols(df, 'RAnkle'); LA = get_xyz_cols(df, 'LAnkle')
-    stance_mid = (RA[:, 0] + LA[:, 0]) / 2.0
-    vel_x = np.diff(rW, prepend=rW[0])
-    for i in range(len(rW)):
-        if np.isnan(rW[i]) or np.isnan(stance_mid[i]):
-            continue
-        if (rW[i] >= stance_mid[i]) and (vel_x[i] > 0):
-            return int(i)
-    with np.errstate(invalid='ignore'):
-        return int(np.nanargmax(rW)) if np.any(~np.isnan(rW)) else len(rW) - 1
-
 def compute_xfactor(df: pd.DataFrame) -> Dict[str, any]:
     # 1) 좌표 읽기
     Ls = get_xyz_cols(df, 'LShoulder')
@@ -359,8 +347,8 @@ def compute_xfactor(df: pd.DataFrame) -> Dict[str, any]:
         xf_smooth = np.clip(xf_smooth, -180, 180)
         xf_by_plane[name] = xf_smooth
 
-    # 9) 임팩트 프레임 탐지
-    impact_idx = detect_impact_by_crossing(df)
+    # 9) 임팩트 프레임 탐지 (impact_utils 공용 함수 사용)
+    impact_idx = detect_impact_by_crossing(df, prefer_2d=False, skip_ratio=0.0, smooth_window=3, hold_frames=0, margin=0.0)
 
     # 10) 임팩트 전 최대 크기(절댓값)/프레임, 임팩트 시 값 (평면별 통계)
     # X-Factor는 음수/양수 부호를 유지하지만, 최대값은 절댓값 기준으로 계산

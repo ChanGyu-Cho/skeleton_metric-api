@@ -61,6 +61,10 @@ except ImportError:
 import sys
 sys.path.append(str(Path(__file__).parent))
 from utils_io import natural_key, ensure_dir
+from impact_utils import (
+    detect_impact_by_crossing as detect_impact_utils,
+    compute_stance_mid_and_width as compute_stance_mid_and_width_utils,
+)
 from runner_utils import (
     parse_joint_axis_map_from_columns,
     is_dataframe_3d,
@@ -116,71 +120,36 @@ def smooth_median_then_moving(x: np.ndarray, w: int = 5) -> np.ndarray:
     return sm.to_numpy()
 
 def compute_stance_mid_and_width(df: pd.DataFrame) -> Tuple[np.ndarray, float]:
-    """스탠스 중심(프레임별)과 폭(스칼라, median) 계산.
-    R/L 발목의 X를 사용. 결측은 NaN 처리 후 median으로 폭 계산.
+    """스탠스 중심(프레임별)과 폭(스칼라, median) 계산 (3D 호환).
+    
+    내부적으로 impact_utils를 사용합니다.
     """
-    N = len(df)
-    RA = get_xyz_cols(df, 'RAnkle'); LA = get_xyz_cols(df, 'LAnkle')
-    RA = _ensure_np(RA, N); LA = _ensure_np(LA, N)
-    rax, lax = RA[:, 0], LA[:, 0]
-    stance_mid = (rax + lax) / 2.0
-    with np.errstate(invalid='ignore'):
-        width_inst = np.abs(rax - lax)
-        stance_width = float(np.nanmedian(width_inst)) if np.any(~np.isnan(width_inst)) else np.nan
-    return stance_mid, stance_width
+    return compute_stance_mid_and_width_utils(df, prefer_2d=False)
 
 def compute_stance_mid_and_width_2d(df: pd.DataFrame) -> Tuple[np.ndarray, float]:
-    """2D CSV에서 스탠스 중심(프레임별)과 폭(median) 계산 (R/L 발목 x 사용)"""
-    cols_map = parse_joint_axis_map_from_columns(df.columns, prefer_2d=True)
-    N = len(df)
-    rax = np.full(N, np.nan, dtype=float)
-    lax = np.full(N, np.nan, dtype=float)
-    rx = (cols_map.get('RAnkle') or {}).get('x')
-    lx = (cols_map.get('LAnkle') or {}).get('x')
-    if rx in df.columns:
-        rax = pd.to_numeric(df[rx], errors='coerce').to_numpy(dtype=float)
-    if lx in df.columns:
-        lax = pd.to_numeric(df[lx], errors='coerce').to_numpy(dtype=float)
-    stance_mid = (rax + lax) / 2.0
-    with np.errstate(invalid='ignore'):
-        width_inst = np.abs(rax - lax)
-        stance_width = float(np.nanmedian(width_inst)) if np.any(~np.isnan(width_inst)) else np.nan
-    return stance_mid, stance_width
+    """2D CSV에서 스탠스 중심(프레임별)과 폭(median) 계산.
+    
+    내부적으로 impact_utils를 사용합니다 (prefer_2d=True).
+    """
+    return compute_stance_mid_and_width_utils(df, prefer_2d=True)
 
 def detect_impact_by_crossing_3d(df: pd.DataFrame, stance_mid: np.ndarray) -> int:
-    """임팩트: RWrist_X3D가 스탠스 중심을 +방향으로 처음 교차하는 프레임.
-    조건: w[i-1] < mid[i-1] and w[i] >= mid[i] and dx[i] > 0
-    없으면 argmax(w)
+    """임팩트: RWrist_X3D가 스탠스 중심을 +방향으로 교차하는 첫 프레임 (3D 호환).
+    
+    내부적으로 impact_utils의 detect_impact_by_crossing을 사용합니다.
+    COM 기반 임팩트 탐지 방식 (모든 메트릭에 일관된 정확한 임팩트 프레임 제공).
+    주의: 기존 시그니처와 호환성을 유지하기 위해 stance_mid 파라미터를 받습니다.
     """
-    N = len(df)
-    RW = get_xyz_cols(df, 'RWrist')
-    RW = _ensure_np(RW, N)
-    w = RW[:, 0]
-    dx = np.diff(w, prepend=w[0])
-    for i in range(1, N):
-        if np.isnan(w[i-1]) or np.isnan(w[i]) or np.isnan(stance_mid[i-1]) or np.isnan(stance_mid[i]):
-            continue
-        if (w[i-1] < stance_mid[i-1]) and (w[i] >= stance_mid[i]) and (dx[i] > 0):
-            return int(i)
-    with np.errstate(invalid='ignore'):
-        return int(np.nanargmax(w)) if np.any(~np.isnan(w)) else N - 1
+    return detect_impact_utils(df, prefer_2d=False, skip_ratio=0.0, smooth_window=3, hold_frames=0, margin=0.0)
 
 def detect_impact_by_crossing_2d(df: pd.DataFrame, stance_mid: np.ndarray) -> int:
-    """2D: RWrist_x가 스탠스 중심을 +방향으로 처음 교차하는 프레임."""
-    cols_map = parse_joint_axis_map_from_columns(df.columns, prefer_2d=True)
-    rwx_col = (cols_map.get('RWrist') or {}).get('x')
-    if not rwx_col or rwx_col not in df.columns:
-        return len(df) - 1 if len(df) > 0 else 0
-    w = pd.to_numeric(df[rwx_col], errors='coerce').to_numpy(dtype=float)
-    N = len(w)
-    dx = np.diff(w, prepend=w[0])
-    for i in range(1, N):
-        if np.isnan(w[i-1]) or np.isnan(w[i]) or np.isnan(stance_mid[i-1]) or np.isnan(stance_mid[i]):
-            continue
-        if (w[i-1] < stance_mid[i-1]) and (w[i] >= stance_mid[i]) and (dx[i] > 0):
-            return int(i)
-    with np.errstate(invalid='ignore'):
-        return int(np.nanargmax(w)) if np.any(~np.isnan(w)) else N - 1
+    """2D: RWrist_x가 스탠스 중심을 +방향으로 교차하는 첫 프레임 (2D 호환).
+    
+    내부적으로 impact_utils의 detect_impact_by_crossing을 사용합니다.
+    COM 기반 임팩트 탐지 방식 (모든 메트릭에 일관된 정확한 임팩트 프레임 제공).
+    주의: 기존 시그니처와 호환성을 유지하기 위해 stance_mid 파라미터를 받습니다.
+    """
+    return detect_impact_utils(df, prefer_2d=True, skip_ratio=0.0, smooth_window=3, hold_frames=0, margin=0.0)
 
 def normalize_angle_to_180(angle: float) -> float:
     """각도를 [-180, 180] 범위로 정규화 (여러 번 360 순환 처리)"""
