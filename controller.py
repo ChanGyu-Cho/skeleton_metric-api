@@ -1349,16 +1349,55 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
                     traceback.print_exc()
                     wide3 = pd.DataFrame()
 
+                # CRITICAL: Apply Z-axis filtering to wide3 BEFORE saving skeleton3d.csv
+                # This ensures all metrics use the same filtered data (atomic operation)
+                if isinstance(wide3, pd.DataFrame) and not wide3.empty:
+                    try:
+                        from metric_algorithm.swing_speed import _filter_depth_outliers
+                        # COCO joint order matching OpenPose 18-keypoint model
+                        JOINTS = ['Nose','LEye','REye','LEar','REar','LShoulder','RShoulder',
+                                  'LElbow','RElbow','LWrist','RWrist','LHip','RHip','LKnee','RKnee','LAnkle','RAnkle']
+                        
+                        print(f"[INFO] Applying Z-axis outlier filtering to skeleton3d.csv...")
+                        n_filtered_total = 0
+                        for joint in JOINTS:
+                            # CRITICAL FIX: Use lowercase 'z' to match actual CSV column names
+                            z_col = f'{joint}__z'
+                            if z_col in wide3.columns:
+                                z_before = wide3[z_col].values.copy()
+                                z_after = _filter_depth_outliers(z_before, verbose=False)
+                                n_filtered = np.sum(np.isfinite(z_before) & ~np.isfinite(z_after))
+                                if n_filtered > 0:
+                                    n_filtered_total += n_filtered
+                                    print(f"[DEBUG]   {joint}: {n_filtered}개 Z값 필터링됨")
+                                wide3[z_col] = z_after
+                        
+                        print(f"[INFO] Z-axis filtering complete: {n_filtered_total}개 이상치 제거됨")
+                        
+                        # Re-interpolate NaN values created by filtering
+                        # This ensures skeleton3d.csv has complete data for all metrics
+                        # CRITICAL FIX: Use lowercase 'z' to match actual CSV column names
+                        z_cols = [c for c in wide3.columns if c.endswith('__z')]
+                        if z_cols:
+                            n_nans_before = wide3[z_cols].isna().sum().sum()
+                            wide3[z_cols] = wide3[z_cols].interpolate(method='linear', axis=0, limit_direction='both')
+                            n_nans_after = wide3[z_cols].isna().sum().sum()
+                            if n_nans_before > 0:
+                                print(f"[INFO] Z-axis interpolation after filtering: NaN count {n_nans_before} → {n_nans_after}")
+                    except Exception as e:
+                        print(f"[WARN] Z-axis filtering failed: {e}")
+                        traceback.print_exc()
+
                 # CRITICAL: Save 3D skeleton CSV (matching 2D skeleton2d.csv format)
                 # Save skeleton3d.csv with wide3 format (frame-by-frame, COCO joints with X/Y/Z coordinates)
-                # NOTE: wide3 comes from already-interpolated df_3d, so no duplicate interpolation
+                # NOTE: wide3 is now filtered and interpolated - all metrics will use this atomic data
                 try:
                     csv_dir = Path(dest_dir) / 'csv'
                     csv_dir.mkdir(parents=True, exist_ok=True)
                     csv_3d_path = csv_dir / f'{job_id}_skeleton3d.csv'
                     if isinstance(wide3, pd.DataFrame) and not wide3.empty:
                         wide3.to_csv(csv_3d_path, index=False)
-                        print(f"[INFO] Saved 3D skeleton CSV: {csv_3d_path}")
+                        print(f"[INFO] Saved filtered 3D skeleton CSV: {csv_3d_path}")
                     else:
                         print(f"[WARN] wide3 DataFrame is empty or not valid, skipping skeleton3d.csv write")
                 except Exception as e:

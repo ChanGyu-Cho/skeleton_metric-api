@@ -274,20 +274,23 @@ def _filter_depth_outliers(z_coords: np.ndarray, verbose: bool = False) -> np.nd
 
 
 def vectorized_speed_m_s_3d(points_xyz: np.ndarray, fps: int, scale_to_m: float = 1.0,
-                            filter_z_outliers: bool = True) -> np.ndarray:
+                            filter_z_outliers: bool = False) -> np.ndarray:
     """
     벡터화된 손목 3D 속도(m/s) 계산
     v = Δs * fps (Δs는 좌표 단위 거리, scale_to_m로 m로 환산)
+    
+    NOTE: filter_z_outliers는 deprecated - controller.py에서 skeleton3d.csv 생성 시 이미 필터링됨
     """
     if points_xyz.ndim != 2 or points_xyz.shape[1] != 3:
         return np.full((len(points_xyz),), np.nan, dtype=float)
     X = points_xyz.astype(float).copy()
 
+    # DEPRECATED: Z-axis filtering now done in controller.py before CSV creation
+    # All metrics share the same filtered skeleton3d.csv data (atomic operation)
     if filter_z_outliers:
-        print(f"[DEBUG] Z축(깊이) 이상치 필터링 시작...")
-        X[:, 2] = _filter_depth_outliers(X[:, 2], verbose=True)  # Z축만 필터링
+        print(f"[WARN] filter_z_outliers=True is deprecated - filtering already applied in skeleton3d.csv")
 
-    # CRITICAL: Single interpolation pass AFTER outlier filtering (not before, not in _filter_depth_outliers)
+    # CRITICAL: Single interpolation pass (skeleton3d.csv is already filtered but may have NaN gaps)
     for c in range(3):
         s = pd.Series(X[:, c])
         s = s.interpolate(limit_direction='both').ffill().bfill()
@@ -661,6 +664,9 @@ def estimate_club_speed_7i_from_wrist(
 def analyze_wrist_speed_3d(df: pd.DataFrame, fps: int, wrist: str = "RWrist", scale_to_m: float = 1.0):
     """
     3D 손목 속도 분석 + 7번 아이언 기준 클럽 속도 추정.
+    
+    NOTE: Z-axis filtering is now done in controller.py when creating skeleton3d.csv
+    All metrics share the same filtered data for consistency (atomic operation)
     """
     W = get_xyz_cols(df, wrist)
     RA = get_xyz_cols(df, 'RAnkle')
@@ -670,7 +676,8 @@ def analyze_wrist_speed_3d(df: pd.DataFrame, fps: int, wrist: str = "RWrist", sc
     coord_range_max = np.nanmax(np.abs(W[~np.isnan(W)]))
     print(f"[DEBUG] analyze_wrist_speed_3d: 좌표 범위 [{coord_range_min:.9f}, {coord_range_max:.6f}], scale_to_m={scale_to_m:.6f}")
 
-    v_m_s = vectorized_speed_m_s_3d(W, fps, scale_to_m=scale_to_m, filter_z_outliers=True)
+    # filter_z_outliers=False: filtering already done in skeleton3d.csv creation
+    v_m_s = vectorized_speed_m_s_3d(W, fps, scale_to_m=scale_to_m, filter_z_outliers=False)
     print(f"[DEBUG] v_m_s 샘플 (처음 10프레임): {v_m_s[:10]}")
 
     v_ms, v_kmh, v_mph = _speed_conversions_m_s(v_m_s)
