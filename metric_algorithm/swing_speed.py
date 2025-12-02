@@ -217,14 +217,14 @@ def _filter_depth_outliers(z_coords: np.ndarray, verbose: bool = False) -> np.nd
     """
     Z 좌표의 이상치를 필터링합니다 (depth 추적 오류 제거).
     
-    방법: IQR (Interquartile Range) 기반 이상치 감지
+    방법: IQR (Interquartile Range) 기반 이상치 감지 (더 보수적)
     - Q1/Q3 계산
     - IQR = Q3 - Q1
-    - 이상치 범위: [Q1 - 1.5*IQR, Q3 + 1.5*IQR]
+    - 이상치 범위: [Q1 - 3.0*IQR, Q3 + 3.0*IQR]  ← 기존 1.5에서 3.0으로 완화 (더 극단적인 이상치만 제거)
     - 범위 밖의 값 → 보간으로 대체
     
-    예시: Z 좌표가 [2200, 2300, ..., 6000 (이상!), ..., 2400]
-          이상치를 보간하여 부드러운 곡선으로 대체
+    예시: Z 좌표가 [2200, 2300, ..., 15000 (이상!), ..., 2400]
+          매우 극단적인 이상치만 제거하고 보간
     """
     z = z_coords.astype(float).copy()
     
@@ -238,9 +238,9 @@ def _filter_depth_outliers(z_coords: np.ndarray, verbose: bool = False) -> np.nd
     q3 = np.percentile(valid_vals, 75)
     iqr = q3 - q1
     
-    # 이상치 범위 정의
-    lower_bound = q1 - 1.5 * iqr
-    upper_bound = q3 + 1.5 * iqr
+    # 이상치 범위 정의 (3.0 * IQR로 완화 - 매우 극단적인 경우만 제거)
+    lower_bound = q1 - 3.0 * iqr
+    upper_bound = q3 + 3.0 * iqr
     
     # 이상치 마스크
     outlier_mask = (z < lower_bound) | (z > upper_bound)
@@ -249,8 +249,8 @@ def _filter_depth_outliers(z_coords: np.ndarray, verbose: bool = False) -> np.nd
         n_outliers = np.sum(outlier_mask)
         if n_outliers > 0:
             outlier_indices = np.where(outlier_mask)[0]
-            print(f"[DEBUG] Z 좌표 이상치 감지: {n_outliers}개")
-            print(f"[DEBUG] IQR 범위: [{lower_bound:.1f}, {upper_bound:.1f}] mm")
+            print(f"[DEBUG] 좌표 이상치 감지: {n_outliers}개")
+            print(f"[DEBUG] IQR 범위: [{lower_bound:.1f}, {upper_bound:.1f}]")
             print(f"[DEBUG] 이상치 프레임: {list(outlier_indices[:5])}{'...' if n_outliers > 5 else ''}")
             print(f"[DEBUG] 이상치 값: {z[outlier_mask][:5]}")
     
@@ -262,7 +262,7 @@ def _filter_depth_outliers(z_coords: np.ndarray, verbose: bool = False) -> np.nd
     z_filtered = z_series.interpolate(method='linear', limit_direction='both').ffill().bfill().to_numpy()
     
     if verbose and np.sum(outlier_mask) > 0:
-        print(f"[DEBUG] ✅ 이상치를 보간으로 대체했습니다")
+        print(f"[DEBUG] 이상치를 보간으로 대체")
     
     return z_filtered
 
@@ -279,10 +279,10 @@ def vectorized_speed_m_s_3d(points_xyz: np.ndarray, fps: int, scale_to_m: float 
       * 카메라 정규화 좌표: 1.0 (0.0002~0.0005 범위, 이미 m 단위)
       * mm 좌표: 0.001 (mm → m)
       * cm 좌표: 0.01 (cm → m)
-    - filter_z_outliers: True이면 depth 이상치(Z 좌표) 필터링
+    - filter_z_outliers: True이면 depth 이상치(Z 좌표) + XY 좌표 필터링
     
     정확한 계산 순서:
-    1. Z 좌표 이상치 제거 (depth 추적 실패 처리)
+    1. XYZ 이상치 필터링 (depth + 2D 추적 오류 처리)
     2. Δs = sqrt((Δx)^2 + (Δy)^2 + (Δz)^2) [좌표 원래 단위]
     3. Δs_m = Δs * scale_to_m [m 단위로 변환]
     4. v_m_s = Δs_m * fps [m/s]
@@ -293,10 +293,17 @@ def vectorized_speed_m_s_3d(points_xyz: np.ndarray, fps: int, scale_to_m: float 
         return np.full((len(points_xyz),), np.nan, dtype=float)
     X = points_xyz.astype(float).copy()
     
-    # ⚠️ CRITICAL: Z 좌표 이상치 필터링 (depth 카메라 추적 오류 제거)
+    # ⚠️ CRITICAL: XYZ 좌표 이상치 필터링 (depth 카메라 추적 오류 + 2D 추적 오류 제거)
     if filter_z_outliers:
-        print(f"[DEBUG] Z 좌표 이상치 필터링 시작...")
-        X[:, 2] = _filter_depth_outliers(X[:, 2], verbose=True)
+        print(f"[DEBUG] XYZ 좌표 이상치 필터링 시작...")
+        
+        # 각 축별로 독립적으로 필터링
+        for axis in range(3):
+            axis_name = ['X', 'Y', 'Z'][axis]
+            X[:, axis] = _filter_depth_outliers(X[:, axis], verbose=False)
+            outlier_count = np.sum(~np.isfinite(X[:, axis]))
+            if outlier_count > 0:
+                print(f"[DEBUG] {axis_name} 축 이상치 처리 완료")
     
     # 각 축별 보간 (결측치 채우기)
     for c in range(3):
@@ -327,10 +334,12 @@ def _speed_conversions_m_s(v_m_s: np.ndarray):
     
     공식:
     - v_km_h = v_m_s * 3.6 [m/s * 3600/1000 = m/s * 3.6 → km/h]
-    - v_mph = v_m_s * 2.237 [m/s * 3600/1609.344 → mph]
+    - v_mph = v_m_s * 2.237094 [정확한 값: 1 m/s = 3.6 / 1.609344 mph]
     """
-    v_kmh = v_m_s * 3.6
-    v_mph = v_m_s * 2.237  # 정확한 값: 3.6 / 1.609344
+    KM_H_PER_M_S = 3.6
+    MPH_PER_M_S = 3.6 / 1.609344  # 정확한 값: 2.237094...
+    v_kmh = v_m_s * KM_H_PER_M_S
+    v_mph = v_m_s * MPH_PER_M_S
     return v_m_s, v_kmh, v_mph
 
 
@@ -451,24 +460,21 @@ def _get_m_per_px_from_cfg(cfg: dict, df_overlay: pd.DataFrame) -> Optional[floa
     """
     analyze.yaml에서 2D 보정 스케일(m/px)을 가져오거나, 관절 쌍 캘리브레이션으로 추정.
     지원 키:
-      - m_per_px_2d: 숫자 (예: 0.0025)
       - calibration_2d:
           method: "joint_pair"
           joint_a: "LShoulder"
           joint_b: "RShoulder"
           real_length_m: 0.40
+      - m_per_px_2d: 숫자 (예: 0.0025)
+    
+    우선순위 (정확도 순서):
+      1. 수동 관절 쌍 캘리브레이션 (가장 정확함 - 실시간 측정)
+      2. 자동 캘리브레이션 (신체 정보 기반)
+      3. 직접 지정 (사전 계산값, fallback)
+    
     반환: m_per_px 또는 None
     """
-    # 직접 지정이 최우선
-    mpp = cfg.get("m_per_px_2d")
-    if mpp is not None:
-        try:
-            val = float(mpp)
-            if val > 0:
-                print(f"🧭 2D 보정 스케일 직접 지정: m_per_px={val:.6f}")
-                return val
-        except Exception:
-            pass
+    # 1순위: 수동 관절 쌍 캘리브레이션 (가장 정확)
     calib = cfg.get("calibration_2d") or {}
     if isinstance(calib, dict) and calib.get("method", "").lower() == "joint_pair":
         ja = calib.get("joint_a")
@@ -481,23 +487,36 @@ def _get_m_per_px_from_cfg(cfg: dict, df_overlay: pd.DataFrame) -> Optional[floa
                     raise ValueError
             except Exception:
                 print("⚠️ calibration_2d.real_length_m 값이 유효하지 않습니다.")
-                return None
-            d_px = _pair_distance_px_series_2d(df_overlay, ja, jb)
-            d_px_valid = d_px[np.isfinite(d_px) & (d_px > 0)]
-            if d_px_valid.size == 0:
-                print("⚠️ 캘리브레이션용 관절 쌍 거리(px)를 계산할 수 없습니다.")
-                return None
-            # 중앙값 사용(노이즈/자세 변화 완화)
-            px_med = float(np.median(d_px_valid))
-            m_per_px = real_len_m / px_med
-            print(f"🧭 2D 캘리브레이션: {ja}-{jb} median={px_med:.2f} px, real={real_len_m:.3f} m → m_per_px={m_per_px:.6f}")
-            return m_per_px
-    # 자동 캘리브레이션 (설정 없을 경우 시도)
+            else:
+                d_px = _pair_distance_px_series_2d(df_overlay, ja, jb)
+                d_px_valid = d_px[np.isfinite(d_px) & (d_px > 0)]
+                if d_px_valid.size > 0:
+                    # 중앙값 사용(노이즈/자세 변화 완화)
+                    px_med = float(np.median(d_px_valid))
+                    m_per_px = real_len_m / px_med
+                    print(f"🧭 [우선순위 1] 수동 관절 쌍 캘리브레이션: {ja}-{jb} median={px_med:.2f} px, real={real_len_m:.3f} m → m_per_px={m_per_px:.6f}")
+                    return m_per_px
+                else:
+                    print("⚠️ 캘리브레이션용 관절 쌍 거리(px)를 계산할 수 없습니다.")
+    
+    # 2순위: 자동 캘리브레이션 (신체 정보 기반)
     auto_flag = True if calib.get("method", "").lower() in ("", "auto") else False
     if auto_flag:
         mpp_auto = _autocalibrate_m_per_px(df_overlay, cfg)
         if mpp_auto is not None:
             return mpp_auto
+    
+    # 3순위: 직접 지정 (fallback)
+    mpp = cfg.get("m_per_px_2d")
+    if mpp is not None:
+        try:
+            val = float(mpp)
+            if val > 0:
+                print(f"🧭 [우선순위 3] 2D 보정 스케일 직접 지정: m_per_px={val:.6f}")
+                return val
+        except Exception:
+            pass
+    
     return None
 
 def _autocalibrate_m_per_px(df: pd.DataFrame, cfg: dict) -> Optional[float]:
@@ -611,28 +630,30 @@ def analyze_wrist_speed_3d(df: pd.DataFrame, fps: int, wrist: str = "RWrist", sc
             abnormal_frames = np.where(abnormal_mask)[0]
             print(f"[WARN] 비정상 속도 프레임 감지: {n_abnormal}개 (limit={speed_upper_bound:.1f} km/h)")
             print(f"[WARN]   프레임: {list(abnormal_frames[:5])}{'...' if n_abnormal > 5 else ''}")
-            print(f"[WARN]   속도: {v_kmh[abnormal_mask][:5]} km/h")
+            print(f"[WARN]   속도: {v_kmh[abnormal_frames[:5]]} km/h")
             
-            # 비정상 속도 프레임을 인접한 정상 속도로 보간
-            for idx in abnormal_frames:
-                # 양쪽에서 정상 값 찾기
-                left_val = None
-                right_val = None
-                for j in range(idx-1, -1, -1):
-                    if not abnormal_mask[j]:
-                        left_val = v_kmh[j]
-                        break
-                for j in range(idx+1, len(v_kmh)):
-                    if not abnormal_mask[j]:
-                        right_val = v_kmh[j]
-                        break
+            # 비정상 속도 프레임을 NaN으로 표시하여 보간
+            v_m_s_for_interp = v_m_s.copy()
+            v_m_s_for_interp[abnormal_mask] = np.nan
+            
+            # 보간 수행 (연속 비정상 프레임도 처리)
+            valid_indices = np.where(~abnormal_mask)[0]
+            if len(valid_indices) > 0:
+                # 전체 배열을 Series로 변환하여 보간
+                v_m_s_series = pd.Series(v_m_s_for_interp)
+                v_m_s_interp = v_m_s_series.interpolate(method='linear', limit_direction='both').ffill().bfill().to_numpy()
                 
-                # 평균으로 대체
-                if left_val is not None and right_val is not None:
-                    v_kmh[idx] = (left_val + right_val) / 2
-                    v_mph[idx] = v_kmh[idx] / 1.609344
-                    v_m_s[idx] = v_kmh[idx] / 3.6
+                # 보간된 값만 업데이트
+                v_m_s[abnormal_mask] = v_m_s_interp[abnormal_mask]
+                
+                # 모든 단위를 일관성 있게 재계산 (m/s 기반)
+                v_ms, v_kmh, v_mph = _speed_conversions_m_s(v_m_s)
+                
+                interpolated_frames = abnormal_frames[v_m_s_interp[abnormal_frames] != v_m_s_for_interp[abnormal_frames]]
+                for idx in interpolated_frames[:5]:
                     print(f"[DEBUG]   Frame {idx}: {v_kmh[idx]:.1f} km/h로 보간")
+                if len(interpolated_frames) > 5:
+                    print(f"[DEBUG]   ... 외 {len(interpolated_frames) - 5}개 프레임")
     
     print(f"[DEBUG] 필터링 후 v_m_s 샘플 (처음 10프레임): {v_m_s[:10]}")
     
@@ -645,7 +666,7 @@ def analyze_wrist_speed_3d(df: pd.DataFrame, fps: int, wrist: str = "RWrist", sc
     hi = min(len(v_kmh) - 1, impact + 2)
     peak_local_idx = lo + int(np.nanargmax(v_kmh[lo:hi+1])) if hi >= lo else int(np.nanargmax(v_kmh))
     peak_wrist_kmh = float(v_kmh[peak_local_idx]) if not np.isnan(v_kmh[peak_local_idx]) else float(np.nanmax(v_kmh))
-    peak_wrist_mph = peak_wrist_kmh / 1.609344  # km/h → mph 정확한 변환
+    peak_wrist_mph = float(v_mph[peak_local_idx]) if not np.isnan(v_mph[peak_local_idx]) else float(np.nanmax(v_mph))  # mph는 v_mph에서 직접 추출
     
     print(f"[DEBUG] Peak frame={peak_local_idx}, v_m_s={v_m_s[peak_local_idx]:.6f}, "
           f"v_km_h={peak_wrist_kmh:.2f}, v_mph={peak_wrist_mph:.2f}")

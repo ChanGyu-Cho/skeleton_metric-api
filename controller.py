@@ -1122,7 +1122,6 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
                     # compute 3D coordinates using intrinsics (found earlier in the tmp tree)
                     # NOTE: do not reassign `intr` here; it was discovered earlier and should persist
                     # joint_idx here refers to COCO-17 index
-
                     for person_idx, person in enumerate(ppl):
                         for joint_idx, (x, y, c) in enumerate(person):
                             X, Y, Zm = (np.nan, np.nan, np.nan)
@@ -1208,10 +1207,6 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
                             x_val = float(X) if not np.isnan(X) else np.nan
                             y_val = float(Y) if not np.isnan(Y) else np.nan
                             z_val = float(Zm) if (not np.isnan(Zm) and Zm is not None and np.isfinite(Zm)) else np.nan
-                            
-                            if frame_idx < 5 or (not np.isnan(x_val) and np.isnan(x_val) == False):  # X가 유효한 데이터만 로그
-                                if frame_idx < 5 or frame_idx % 100 == 0:  # 처음 5프레임 + 100의 배수
-                                    print(f"[DEBUG] Storing: Frame {frame_idx}, J{joint_idx}: X={x_val}, Y={y_val}, Z={z_val} (raw Zm={Zm})")
                             
                             rows.append({
                                 'frame': frame_idx,
@@ -2619,10 +2614,27 @@ def upload_result_to_s3(dest_dir: Path, job_id: str, s3_key: Optional[str] = Non
             except Exception:
                 target_prefix = None
 
-        # canonical job json only
-        local_json = Path(dest_dir) / f"{job_id}.json"
-        if not local_json.exists():
-            raise FileNotFoundError(f'Result file not found: {local_json}')
+        # canonical job json only - look for {dimension}_{job_id}.json first, fallback to {job_id}.json
+        # (process_and_save saves as result_basename.json = "{dimension}_{job_id}.json")
+        local_json = None
+        dimension_prefix = None
+        
+        # Try to infer dimension from available files
+        for dim in ['3d', '2d']:
+            candidate = Path(dest_dir) / f"{dim}_{job_id}.json"
+            if candidate.exists():
+                local_json = candidate
+                dimension_prefix = dim
+                break
+        
+        # Fallback: check legacy naming
+        if local_json is None:
+            candidate = Path(dest_dir) / f"{job_id}.json"
+            if candidate.exists():
+                local_json = candidate
+        
+        if local_json is None or not local_json.exists():
+            raise FileNotFoundError(f'Result file not found: {local_json} (checked {dimension_prefix or "legacy naming"} format)')
 
         uploaded = []
         if target_prefix:
