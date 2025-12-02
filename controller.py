@@ -393,6 +393,15 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
                 print(f"[DEBUG] S3에서 MP4 다운로드 중: {bucket}/{key}")
                 s3.download_file(bucket, key, str(local_video))
                 print(f"[DEBUG] 다운로드 완료: {local_video}")
+                
+                # Also save a copy to dest_dir/local_input.mp4 for debugging/inspection
+                try:
+                    import shutil
+                    local_input_mp4 = dest_dir / 'local_input.mp4'
+                    shutil.copy2(str(local_video), str(local_input_mp4))
+                    print(f"[DEBUG] S3 파일 복사본 저장: {local_input_mp4}")
+                except Exception as e:
+                    print(f"[WARN] S3 파일 복사본 저장 실패: {e}")
 
             import cv2
             cap = cv2.VideoCapture(str(local_video))
@@ -404,7 +413,12 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
             cap.release()
             print(f"[INFO] Video dimensions: {frame_width}x{frame_height}")
             print(f"[DEBUG] 2D path: fps_float={fps_float}, fps={fps}")
-            if fps:
+            
+            # Ensure fps has a valid value for metrics pipeline
+            if fps is None or fps <= 0:
+                fps = 60  # Default to 60fps if not available from metadata
+                print(f"[INFO] fps not available in video metadata, using default={fps}")
+            else:
                 print(f"[INFO] Extracted fps={fps} from 2D video")
 
             crop_strategy = os.environ.get('OPENPOSE_CROP_STRATEGY', 'yolo').lower().strip()
@@ -647,7 +661,8 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
                     frames_keypoints.append(person)
             
             # CRITICAL: Apply interpolation (matches local preprocessing exactly)
-            # Local uses: conf_thresh=0.0, method='linear', fill_method='zero', interp_limit=None
+            # NOTE: conf_thresh is now ignored since confidence filtering was disabled
+            # All (x,y) coordinates are preserved unless they are (0,0,0)
             interp = interpolate_sequence(
                 frames_keypoints,
                 conf_thresh=0.0,
@@ -658,14 +673,6 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
             
             if not interp:
                 raise RuntimeError('Interpolated sequence empty')
-            
-            # Apply Butterworth smoothing to remove jitter/noise from OpenPose
-            try:
-                from metric_algorithm.smoothing import remove_jitter
-                interp = remove_jitter(interp, threshold=50.0)
-                print("[INFO] Applied jitter removal to 2D keypoints")
-            except Exception as e:
-                print(f"[WARN] Jitter removal failed: {e}")
             
             # CRITICAL: Transform cropped coordinates back to original frame space
             # Local preprocessing saves coordinates in original frame space, not cropped
@@ -779,6 +786,15 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
                     print(f"[DEBUG] S3에서 ZIP 다운로드 중: {bucket}/{key}")
                     s3.download_file(bucket, key, str(local_zip))
                     print(f"[DEBUG] 다운로드 완료: {local_zip}")
+                    
+                    # Also save a copy to dest_dir/local_input.zip for debugging/inspection
+                    try:
+                        import shutil
+                        local_input_zip = dest_dir / 'local_input.zip'
+                        shutil.copy2(str(local_zip), str(local_input_zip))
+                        print(f"[DEBUG] S3 파일 복사본 저장: {local_input_zip}")
+                    except Exception as e:
+                        print(f"[WARN] S3 파일 복사본 저장 실패: {e}")
 
                 # 안전한 압축 해제(zip-slip 방지)와 간단한 용량 제한 처리
                 MAX_FILES = 5000
@@ -938,6 +954,18 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
                                         print(f"[WARN] Failed to parse fps from meta: {e}")
                     except Exception:
                         pass
+                    
+                    # CRITICAL FIX: If fps is still None after intrinsics extraction, estimate from frame count
+                    # This ensures metrics modules always have a valid fps for overlay generation
+                    if fps is None and depth_count > 0:
+                        # Estimate fps: assume 60fps for depth-based recordings (common for RealSense D455)
+                        # This is a reasonable default that matches typical depth recorder fps
+                        fps = 60
+                        print(f"[INFO] fps not found in intrinsics, using default={fps} (based on depth frame count={depth_count})")
+                    elif fps is None:
+                        # Final fallback: use 30fps
+                        fps = 30
+                        print(f"[INFO] fps not found, using final fallback={fps}")
 
                     # record inferred scale into depth_map_info for diagnostics
                     try:
@@ -997,6 +1025,8 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
                         frames_keypoints_3d.append(person)
                 
                 # Apply interpolation (matching 2D path exactly)
+                # NOTE: conf_thresh is now ignored since confidence filtering was disabled
+                # All (x,y) coordinates are preserved unless they are (0,0,0)
                 interp_3d = interpolate_sequence(
                     frames_keypoints_3d,
                     conf_thresh=0.0,
@@ -1350,19 +1380,28 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
                 try:
                     dest_img_dir = Path(dest_dir) / 'img'
                     dest_img_dir.mkdir(parents=True, exist_ok=True)
+                    print(f"[DEBUG] Created dest_img_dir: {dest_img_dir}")
 
                     # Prefer original color frames (if present). For 3D runs color_dir contains originals.
                     try:
                         # If color_dir exists in tmp tree, copy those images as the canonical RGB frames
                         if 'color_dir' in locals() and Path(color_dir).exists():
-                            for p in sorted(Path(color_dir).iterdir()):
+                            print(f"[DEBUG] Attempting to copy from color_dir: {color_dir}")
+                            color_files = sorted([p for p in Path(color_dir).iterdir() if p.is_file() and p.suffix.lower() in ('.png', '.jpg', '.jpeg')])
+                            print(f"[DEBUG] Found {len(color_files)} color image files in {color_dir}")
+                            copied_count = 0
+                            for p in color_files:
                                 try:
-                                    if p.is_file() and p.suffix.lower() in ('.png', '.jpg', '.jpeg'):
-                                        shutil.copy2(str(p), str(dest_img_dir / p.name))
-                                except Exception:
-                                    pass
-                    except Exception:
-                        pass
+                                    shutil.copy2(str(p), str(dest_img_dir / p.name))
+                                    copied_count += 1
+                                except Exception as e:
+                                    print(f"[WARN] Failed to copy {p.name}: {e}")
+                            print(f"[DEBUG] Successfully copied {copied_count}/{len(color_files)} color images to {dest_img_dir}")
+                        else:
+                            print(f"[DEBUG] color_dir not available or doesn't exist (color_dir in locals: {'color_dir' in locals()}, exists: {Path(color_dir).exists() if 'color_dir' in locals() else 'N/A'})")
+                    except Exception as e:
+                        print(f"[ERROR] Exception while copying color_dir images: {e}")
+                        traceback.print_exc()
 
                     # If we have an input mp4 (2D path), try to extract frames into dest/img so overlays draw on RGB
                     try:
@@ -1427,14 +1466,25 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
                 try:
                     # Prefer using original color frames if available (avoid using OpenPose-rendered images)
                     imgs = []
+                    src_desc = 'none'
                     try:
+                        print(f"[DEBUG] Starting overlay MP4 generation for dimension={dimension}")
+                        print(f"[DEBUG]   color_dir variable check: {'color_dir' in locals()}, exists: {Path(color_dir).exists() if 'color_dir' in locals() else 'N/A'}")
+                        print(f"[DEBUG]   dest_img_dir: {dest_img_dir}, exists: {dest_img_dir.exists()}")
+                        
                         # prefer color_dir (original frames) when present
                         if 'color_dir' in locals() and Path(color_dir).exists():
                             imgs = sorted([p for p in Path(color_dir).iterdir() if p.suffix.lower() in ('.jpg', '.jpeg', '.png')])
                             src_desc = 'color_dir'
+                            print(f"[DEBUG]   Using color_dir: found {len(imgs)} images")
                         else:
-                            imgs = sorted([p for p in dest_img_dir.iterdir() if p.suffix.lower() in ('.jpg', '.jpeg', '.png')]) if dest_img_dir.exists() else []
-                            src_desc = 'dest_img_dir'
+                            if dest_img_dir.exists():
+                                imgs = sorted([p for p in dest_img_dir.iterdir() if p.suffix.lower() in ('.jpg', '.jpeg', '.png')])
+                                src_desc = 'dest_img_dir'
+                                print(f"[DEBUG]   Using dest_img_dir: found {len(imgs)} images")
+                            else:
+                                print(f"[DEBUG]   dest_img_dir does not exist: {dest_img_dir}")
+                        
                         # deduplicate by name while preserving order
                         seen = set()
                         uniq = []
@@ -1444,7 +1494,11 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
                             seen.add(p.name)
                             uniq.append(p)
                         imgs = uniq
-                    except Exception:
+                        print(f"[DEBUG]   After dedup: {len(imgs)} unique images from {src_desc}")
+                    except Exception as e:
+                        print(f"[ERROR] Image collection failed: {e}")
+                        import traceback
+                        traceback.print_exc()
                         imgs = []
                         src_desc = 'none'
 
@@ -1453,17 +1507,26 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
                             from metric_algorithm.runner_utils import images_to_mp4
                             out_mp4 = Path(dest_dir) / f"{job_id}_overlay.mp4"
                             overlay_fps = fps if fps is not None else 30.0
+                            print(f"[INFO] Generating overlay MP4 with {len(imgs)} images, fps={overlay_fps}, output={out_mp4}")
                             created, used = images_to_mp4(imgs, out_mp4, fps=overlay_fps, resize=None, filter_rendered=True, write_debug=True)
+                            print(f"[INFO] Overlay MP4 generation result: created={created}, used={used} images")
                             if created:
                                 try:
                                     (Path(dest_dir) / 'overlay_debug.json').write_text(json.dumps({'overlay_source': src_desc, 'images_used': used}), encoding='utf-8')
                                 except Exception:
                                     pass
-                        except Exception:
-                            # ignore if helper missing or fails
-                            pass
-                except Exception:
-                    pass
+                            else:
+                                print(f"[WARN] images_to_mp4() returned created=False")
+                        except Exception as e:
+                            print(f"[ERROR] images_to_mp4 call failed: {e}")
+                            import traceback
+                            traceback.print_exc()
+                    else:
+                        print(f"[WARN] No images found for overlay MP4 generation (src_desc={src_desc})")
+                except Exception as e:
+                    print(f"[ERROR] Overlay MP4 generation block failed: {e}")
+                    import traceback
+                    traceback.print_exc()
 
             # end of tmp work; we intentionally DO NOT remove tmp_dir here so files remain for debugging
             # If automatic cleanup is desired, uncomment the following line to remove the tmp dir:
@@ -1482,6 +1545,7 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
         else:
             # 3D path: apply interpolation
             sequence = [(ppl[0] if (ppl and len(ppl) > 0) else []) for ppl in result_by_frame]
+            # NOTE: conf_thresh is now ignored since confidence filtering was disabled
             interpolated = interpolate_sequence(sequence, conf_thresh=0.0, method='linear', fill_method='zero')
             people_sequence = [([person] if person else []) for person in interpolated]
 
@@ -1599,6 +1663,13 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
             # Prepare context for metrics modules
             # IMPORTANT: Include intrinsics (depth_scale, etc) for swing_speed scale conversion
             ctx_for_metrics = locals().copy()
+            
+            # CRITICAL: Add img_dir explicitly for metric modules (swing_speed needs this to find overlay images)
+            # This is crucial for both 2D and 3D paths to generate overlay MP4s
+            if 'dest_img_dir' in locals():
+                ctx_for_metrics['img_dir'] = str(dest_img_dir)
+                print(f"[DEBUG] ✓ Added img_dir to ctx_for_metrics: {dest_img_dir}")
+            
             print(f"[DEBUG] 'intr_full' in locals: {'intr_full' in locals()}")
             if 'intr_full' in locals():
                 print(f"[DEBUG] intr_full type: {type(intr_full)}")

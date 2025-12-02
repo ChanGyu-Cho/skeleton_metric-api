@@ -210,52 +210,29 @@ def smooth_skeleton_wide(df: pd.DataFrame, order: int = 2, cutoff: float = 0.1,
 
 def remove_jitter(keypoints: List[List[List[float]]], threshold: float = 50.0) -> List[List[List[float]]]:
     """
-    순간적 튀는 좌표 제거 (threshold 기반)
+    DISABLED: 순간적 튀는 좌표 제거 (threshold 기반)
     
-    연속된 프레임 간 좌표 변화가 threshold를 초과하면 이전값으로 유지
+    REASON: This function was replacing values that exceeded threshold with previous values,
+    causing "frozen coordinates" where later frames would permanently use earlier values.
+    This destroyed the original data.
+    
+    CRITICAL PRINCIPLE: Never filter/replace original OpenPose data.
+    Only interpolate when data is actually missing (NaN or [0,0,0]).
     
     Parameters
     ----------
     keypoints : List[List[List[float]]]
         프레임별 관절 좌표 ([[x, y, c], ...])
     threshold : float
-        최대 허용 변화 픽셀수 (기본 50)
+        IGNORED - threshold filtering is disabled
     
     Returns
     -------
     List[List[List[float]]]
-        jitter 제거된 좌표
+        원본 데이터 그대로 반환 (수정 없음)
     """
-    if len(keypoints) < 2:
-        return keypoints
-    
-    result = [keypoints[0].copy()]
-    
-    for frame_idx in range(1, len(keypoints)):
-        current_frame = keypoints[frame_idx].copy()
-        prev_frame = result[-1]
-        
-        # 각 관절별로 변화량 확인
-        for joint_idx, (x, y, c) in enumerate(current_frame):
-            if joint_idx >= len(prev_frame):
-                continue
-            
-            px, py, pc = prev_frame[joint_idx]
-            
-            # confidence 확인 (conf > 0.1이어야 유효)
-            if c < 0.1 or pc < 0.1:
-                continue
-            
-            # 거리 계산
-            dist = np.sqrt((x - px)**2 + (y - py)**2)
-            
-            # 임계값 초과 시 이전값 사용
-            if dist > threshold:
-                current_frame[joint_idx] = [px, py, c]
-        
-        result.append(current_frame)
-    
-    return result
+    # DISABLED: Do not modify the data
+    return keypoints
 
 
 def calculate_z_bounds(df_3d: pd.DataFrame, n_std: float = 2.5, 
@@ -441,11 +418,12 @@ def filter_z_outliers_by_frame_delta(df_tidy: pd.DataFrame,
             # 실제 프레임 간 거리
             z_delta = np.abs(z_values[curr_idx] - z_values[prev_idx])
             
-            # 상대적 threshold 초과 → 현재값을 NaN으로 마킹
-            if z_delta > z_threshold:
-                df.loc[indices[curr_idx], 'Z'] = np.nan
-                df.loc[indices[curr_idx], 'X'] = np.nan
-                df.loc[indices[curr_idx], 'Y'] = np.nan
+            # NOTE: DISABLED - Do not mark as NaN
+            # Reason: Original data should be preserved, never deleted
+            # if z_delta > z_threshold:
+            #     df.loc[indices[curr_idx], 'Z'] = np.nan
+            #     df.loc[indices[curr_idx], 'X'] = np.nan
+            #     df.loc[indices[curr_idx], 'Y'] = np.nan
     
     return df
 
@@ -521,10 +499,11 @@ def filter_z_outliers_by_frame_consistency(df_tidy: pd.DataFrame,
                 # 중앙값으로부터 편차 계산 (절대값)
                 z_deviation = np.abs(z_val - core_median)
                 
-                # 편차가 상대적 threshold를 초과하면 이상치
-                if z_deviation > z_threshold:
-                    df.loc[idx, 'Z'] = np.nan
-                    df.loc[idx, 'X'] = np.nan
-                    df.loc[idx, 'Y'] = np.nan
+                # NOTE: DISABLED - Do not mark as NaN
+                # Reason: Original data should be preserved, never deleted
+                # if z_deviation > z_threshold:
+                #     df.loc[idx, 'Z'] = np.nan
+                #     df.loc[idx, 'X'] = np.nan
+                #     df.loc[idx, 'Y'] = np.nan
     
     return df
