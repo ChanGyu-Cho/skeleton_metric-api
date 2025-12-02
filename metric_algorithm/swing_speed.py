@@ -45,13 +45,9 @@ from runner_utils import (
     normalize_result,
 )
 
-# =========================================================
-# 공통 유틸/매핑 함수 (유연한 헤더 지원)
-# 참고: 다음 함수들은 runner_utils.py에서 임포트합니다
-# - parse_joint_axis_map_from_columns(): 컬럼명 매핑
-# - get_xyz_cols(): 3D 좌표 추출
-# - get_xyc_row(): 행에서 좌표 추출
-# =========================================================
+# 7번 아이언 길이 (37 inch ≒ 0.94 m) 고정 가정
+CLUB_LENGTH_7I_M = 0.94
+EPS_R = 1e-6  # 반지름 0 방지용
 
 # =========================================================
 # 2D 스무딩 유틸들 (점프 제한 없는 필터들)
@@ -582,7 +578,7 @@ def analyze_wrist_speed_3d(df: pd.DataFrame, fps: int, wrist: str = "RWrist", sc
       - impact_frame, peak_frame
       - 시계열 속도 v_m_s, v_km_h, v_mph (모두 m/s 기준으로 변환됨)
       - 피크 속도(손목) km/h, mph
-      - 클럽 헤드 추정 속도(k=1.35) 및 범위(k=1.25~1.55)
+      - 7번 아이언(37") 각속도 기반 클럽 헤드 속도 추정
     
     계산 프로세스:
     1. 손목 3D 좌표(X, Y, Z) 추출
@@ -590,16 +586,16 @@ def analyze_wrist_speed_3d(df: pd.DataFrame, fps: int, wrist: str = "RWrist", sc
     3. scale_to_m 적용하여 m 단위로 변환: Δs_m = Δs * scale_to_m
     4. 속도 계산: v_m_s = Δs_m * fps [m/s]
     5. 변환: v_km_h = v_m_s * 3.6, v_mph = v_m_s * 2.237
+    6. 어깨 중앙을 회전축으로 가정, 반지름 비율로 클럽헤드 속도 추정
     """
     W = get_xyz_cols(df, wrist)         # (N,3) 좌표 원래 단위
     RA = get_xyz_cols(df, 'RAnkle')     # (N,3)
     LA = get_xyz_cols(df, 'LAnkle')     # (N,3)
     
     # 좌표 범위 로깅 (단위 확인용)
-    coord_range_min = np.nanmin(np.abs(W[~np.isnan(W)]))
-    coord_range_max = np.nanmax(np.abs(W[~np.isnan(W)]))
-    coord_range_min = np.nanmin(np.abs(W[~np.isnan(W)]))
-    coord_range_max = np.nanmax(np.abs(W[~np.isnan(W)]))
+    coord_vals = W[~np.isnan(W)]
+    coord_range_min = np.nanmin(np.abs(coord_vals)) if coord_vals.size > 0 else 0.0
+    coord_range_max = np.nanmax(np.abs(coord_vals)) if coord_vals.size > 0 else 0.0
     print(f"[DEBUG] analyze_wrist_speed_3d: 좌표 범위 [{coord_range_min:.9f}, {coord_range_max:.6f}], scale_to_m={scale_to_m:.6f}")
     print(f"[DEBUG] scale_to_m={scale_to_m} → 예상 단위: {'mm' if scale_to_m==0.001 else 'cm' if scale_to_m==0.01 else 'm'}")
     
@@ -671,13 +667,41 @@ def analyze_wrist_speed_3d(df: pd.DataFrame, fps: int, wrist: str = "RWrist", sc
     print(f"[DEBUG] Peak frame={peak_local_idx}, v_m_s={v_m_s[peak_local_idx]:.6f}, "
           f"v_km_h={peak_wrist_kmh:.2f}, v_mph={peak_wrist_mph:.2f}")
     
-    # 클럽 헤드 추정 (가중치)
-    k = 1.35
-    k_min, k_max = 1.25, 1.55
-    club_kmh = peak_wrist_kmh * k
-    club_mph = peak_wrist_mph * k
-    club_kmh_min, club_kmh_max = peak_wrist_kmh * k_min, peak_wrist_kmh * k_max
-    club_mph_min, club_mph_max = peak_wrist_mph * k_min, peak_wrist_mph * k_max
+    # ---- 7번 아이언(37") 기준 각속도 기반 클럽 헤드 속도 추정 ----
+    try:
+        LSH = get_xyz_cols(df, 'LShoulder')  # (N,3)
+        RSH = get_xyz_cols(df, 'RShoulder')  # (N,3)
+
+        lsh_pt = LSH[peak_local_idx]
+        rsh_pt = RSH[peak_local_idx]
+        pivot_raw = 0.5 * (lsh_pt + rsh_pt)   # 회전축(원래 단위)
+
+        wrist_raw = W[peak_local_idx]        # 원래 단위
+        r_wrist_raw = float(np.linalg.norm(wrist_raw - pivot_raw))
+        r_wrist_m = r_wrist_raw * float(scale_to_m)
+        r_head_m = r_wrist_m + CLUB_LENGTH_7I_M
+
+        scale = r_head_m / max(r_wrist_m, EPS_R)
+        club_kmh = peak_wrist_kmh * scale
+        club_mph = peak_wrist_mph * scale
+
+        club_kmh_min = club_kmh_max = club_kmh
+        club_mph_min = club_mph_max = club_mph
+        effective_k = scale
+
+    except Exception as e:
+        print(f"[WARN] 3D 클럽 속도 각속도 기반 계산 실패, k-factor 폴백 사용: {e}")
+        k = 1.35
+        club_kmh = peak_wrist_kmh * k
+        club_mph = peak_wrist_mph * k
+        club_kmh_min = peak_wrist_kmh * 1.25
+        club_kmh_max = peak_wrist_kmh * 1.55
+        club_mph_min = peak_wrist_mph * 1.25
+        club_mph_max = peak_wrist_mph * 1.55
+        effective_k = k
+        r_wrist_m = None
+        r_head_m = None
+        scale = None
     
     return {
         'impact_frame': int(impact),
@@ -691,6 +715,10 @@ def analyze_wrist_speed_3d(df: pd.DataFrame, fps: int, wrist: str = "RWrist", sc
         'club_mph': club_mph,
         'club_kmh_range': (club_kmh_min, club_kmh_max),
         'club_mph_range': (club_mph_min, club_mph_max),
+        'club_k_factor_effective': effective_k,
+        'r_wrist_m': r_wrist_m,
+        'r_head_m': r_head_m,
+        'scale_r_head_over_r_wrist': scale,
     }
 
 def analyze_wrist_speed_2d(df: pd.DataFrame, fps: int, wrist: str = "RWrist", m_per_px: Optional[float] = None):
@@ -701,6 +729,7 @@ def analyze_wrist_speed_2d(df: pd.DataFrame, fps: int, wrist: str = "RWrist", m_
       - 시계열 속도 v_px_s
       - 피크 속도(손목) px/s
       - m_per_px 스케일이 있으면 m/s, km/h, mph도 함께 제공
+      - 7번 아이언(37") 각속도 기반 클럽 헤드 속도 추정 (2D)
     """
     W = get_xy_cols_2d(df, wrist)        # (N,2) px
     RA = get_xy_cols_2d(df, 'RAnkle')     # (N,2) px (없으면 NaN)
@@ -728,13 +757,40 @@ def analyze_wrist_speed_2d(df: pd.DataFrame, fps: int, wrist: str = "RWrist", m_
         peak_wrist_kmh = float(v_kmh[peak_local_idx]) if not np.isnan(v_kmh[peak_local_idx]) else float(np.nanmax(v_kmh))
         peak_wrist_mph = peak_wrist_kmh / 1.609344  # km/h → mph 정확한 변환
         
-        # 클럽 추정 가중치 동일 적용
-        k = 1.35
-        k_min, k_max = 1.25, 1.55
-        club_kmh = peak_wrist_kmh * k
-        club_mph = peak_wrist_mph * k
-        club_kmh_min, club_kmh_max = peak_wrist_kmh * k_min, peak_wrist_kmh * k_max
-        club_mph_min, club_mph_max = peak_wrist_mph * k_min, peak_wrist_mph * k_max
+        # ---- 7번 아이언(37") 기준 각속도 기반 클럽 헤드 속도 추정 ----
+        try:
+            LSH = get_xy_cols_2d(df, 'LShoulder')  # (N,2)
+            RSH = get_xy_cols_2d(df, 'RShoulder')  # (N,2)
+            lsh_pt = LSH[peak_local_idx]
+            rsh_pt = RSH[peak_local_idx]
+            pivot_px = 0.5 * (lsh_pt + rsh_pt)
+
+            wrist_px = W[peak_local_idx]
+            r_wrist_px = float(np.linalg.norm(wrist_px - pivot_px))
+            r_wrist_m = r_wrist_px * float(m_per_px)
+            r_head_m = r_wrist_m + CLUB_LENGTH_7I_M
+
+            scale = r_head_m / max(r_wrist_m, EPS_R)
+            club_kmh = peak_wrist_kmh * scale
+            club_mph = peak_wrist_mph * scale
+
+            club_kmh_min = club_kmh_max = club_kmh
+            club_mph_min = club_mph_max = club_mph
+            effective_k = scale
+
+        except Exception as e:
+            print(f"[WARN] 2D 클럽 속도 각속도 기반 계산 실패, k-factor 폴백 사용: {e}")
+            k = 1.35
+            club_kmh = peak_wrist_kmh * k
+            club_mph = peak_wrist_mph * k
+            club_kmh_min = peak_wrist_kmh * 1.25
+            club_kmh_max = peak_wrist_kmh * 1.55
+            club_mph_min = peak_wrist_mph * 1.25
+            club_mph_max = peak_wrist_mph * 1.55
+            effective_k = k
+            r_wrist_m = None
+            r_head_m = None
+            scale = None
         
         return {
             'impact_frame': int(impact),
@@ -752,6 +808,10 @@ def analyze_wrist_speed_2d(df: pd.DataFrame, fps: int, wrist: str = "RWrist", m_
             'club_mph_range': (club_mph_min, club_mph_max),
             'unit': 'px/s',
             'calibrated_m_per_px': float(m_per_px),
+            'club_k_factor_effective': effective_k,
+            'r_wrist_m': r_wrist_m,
+            'r_head_m': r_head_m,
+            'scale_r_head_over_r_wrist': scale,
         }
     
     # 보정 불가 시 기존(px/s)만 반환
@@ -793,31 +853,33 @@ def _coord_scale_to_m(cfg: dict) -> float:
     
     우선순위 (높을수록 신뢰도 높음):
     1. intrinsics.json의 depth_scale (controller.py가 저장한 메타정보, 가장 신뢰도 높음)
+       ⚠️ depth_scale은 RAW depth → MM 변환 계수입니다 (예: 0.001 = RAW × 0.001 = MM)
+       controller.py가 CSV에 METER 단위로 저장하므로, scale_to_m = 1.0 적용
     2. analyze.yaml의 명시적 coord_unit 설정
     3. wide3 데이터 범위로부터 자동 감지
-    4. 기본값: 0.001 (MM 단위로 간주, 대부분의 3D depth 카메라가 MM 저장)
+    4. 기본값: 1.0 (미터 단위, controller.py의 현재 표준)
     
     지원 단위: m, cm, mm (대소문자 무시)
     
-    ⚠️ 중요: controller.py의 3D 처리 결과는 MM 단위로 저장되므로,
-            intrinsics에 depth_scale이 없더라도 기본값은 0.001이어야 합니다.
+    ⚠️ 중요: controller.py의 3D 처리는 이제 METER 단위로 저장합니다 (depth_scale과 무관).
     """
-    # 1단계: intrinsics.json의 depth_scale (가장 신뢰도 높음)
+    # 1단계: intrinsics.json의 depth_scale (존재 여부 확인만, 값은 사용 안함)
     if 'intrinsics' in cfg and isinstance(cfg['intrinsics'], dict):
         meta = cfg['intrinsics'].get('meta', {})
         if isinstance(meta, dict):
             depth_scale = meta.get('depth_scale')
             if depth_scale is not None:
                 try:
-                    scale = float(depth_scale)
-                    if scale > 0:
-                        print(f"[INFO] ✅ LEVEL 1: intrinsics.depth_scale 사용: {scale:.6f} (m/unit)")
-                        return scale
+                    scale_val = float(depth_scale)
+                    if scale_val > 0:
+                        # depth_scale은 RAW→MM 계수이고, CSV는 METER 단위이므로
+                        # scale_to_m = 1.0 (이미 미터 단위)
+                        print(f"[INFO] ✅ LEVEL 1: intrinsics.depth_scale 감지 ({scale_val:.6f}), CSV는 METER 단위 → scale_to_m=1.0")
+                        return 1.0
                 except (TypeError, ValueError):
                     pass
     
     # 2단계: analyze.yaml의 coord_unit 명시 설정
-    # (coord_unit이 명시되어 있으면 자동 감지보다 우선)
     if 'coord_unit' in cfg:
         unit = (cfg.get("coord_unit") or "").strip().lower()
         if unit:
@@ -856,48 +918,37 @@ def _coord_scale_to_m(cfg: dict) -> float:
                     min_val = float(min([v for v in all_vals if v > 0]))
                     print(f"[DEBUG]   좌표 범위: [{min_val:.9f}, {max_val:.6f}]")
                     
-                    # Heuristic 판정 (더 신뢰도 높은 순서)
-                    # 카메라 정규화 좌표: 0.0001 ~ 0.001 범위 (이미 m)
-                    if min_val >= 0.0001 and max_val < 0.001:
-                        print(f"[INFO] 🎯 LEVEL 3a: 카메라 정규화 좌표 → scale_to_m=1.0")
+                    # ⚠️ controller.py는 이제 METER 단위 저장하므로 범위 heuristic도 변경
+                    # 미터 범위: 0.1 ~ 10
+                    if min_val >= 0.001 and max_val <= 10:
+                        print(f"[INFO] 🎯 LEVEL 3a: 미터 범위 좌표 → scale_to_m=1.0")
                         return 1.0
                     
-                    # MM 단위 (controller 저장): 50 이상이면 MM 범위로 강하게 간주
-                    # ⚠️ 신뢰도 높음: depth 카메라가 항상 MM 저장
+                    # MM 범위 (구식 데이터): 50 이상
                     elif max_val >= 50:
                         print(f"[INFO] 🎯 LEVEL 3b: MM 범위 좌표 (max={max_val:.2f}) → scale_to_m=0.001")
                         return 1e-3
                     
-                    # m 범위: 1 ~ 10
-                    elif min_val >= 1 and max_val <= 10:
-                        print(f"[INFO] 🎯 LEVEL 3c: m 범위 좌표 → scale_to_m=1.0")
+                    # CM 범위: 0.1 ~ 10
+                    elif min_val >= 0.1 and max_val <= 10:
+                        print(f"[INFO] 🎯 LEVEL 3c: CM 범위 → scale_to_m=0.01")
+                        return 0.01
+                    
+                    # 카메라 정규화 좌표: 0.0001 ~ 0.001
+                    elif min_val >= 0.00001 and max_val < 0.001:
+                        print(f"[INFO] 🎯 LEVEL 3d: 카메라 정규화 좌표 → scale_to_m=1.0")
                         return 1.0
                     
-                    # 평활화/변환된 좌표: 0.1 ~ 50
-                    elif min_val >= 0.1 and max_val < 50:
-                        print(f"[DEBUG]   평활화 좌표 범위 [{min_val:.2f}, {max_val:.2f}]")
-                        # 30 이상이면 MM/10 스케일
-                        if max_val >= 30:
-                            print(f"[INFO] 🎯 LEVEL 3d: MM/10 스케일 → scale_to_m=0.0001")
-                            return 0.0001
-                        # 10 이상 30 미만이면 CM 또는 평활화된 m
-                        elif max_val >= 10:
-                            print(f"[INFO] 🎯 LEVEL 3e: CM 범위 → scale_to_m=0.01")
-                            return 0.01
-                        else:
-                            print(f"[INFO] 🎯 LEVEL 3f: m 범위 → scale_to_m=1.0")
-                            return 1.0
-                    
-                    print(f"[WARN] 범위 판정 실패 [{min_val:.6f}, {max_val:.6f}], 기본값 MM 단위 적용")
+                    print(f"[WARN] 범위 판정 실패 [{min_val:.6f}, {max_val:.6f}], 기본값 미터 단위 적용")
             else:
                 print(f"[DEBUG] 3D 컬럼 없음. 컬럼 샘플: {list(wide3.columns)[:5]}")
     except Exception as e:
         print(f"[DEBUG] 자동 감지 오류: {e}")
     
-    # ⚠️ 최종 기본값: 0.001 (MM 단위)
-    # 대부분의 3D depth 카메라와 controller.py의 처리 결과가 MM 저장하므로
-    print(f"[WARN] 좌표 단위 미결정 → 기본값 MM 단위 적용 (scale_to_m=0.001)")
-    return 1e-3
+    # ⚠️ 최종 기본값: 1.0 (미터 단위)
+    # controller.py가 항상 미터 단위로 저장하므로
+    print(f"[INFO] 좌표 단위 미결정 → 기본값 미터 단위 적용 (scale_to_m=1.0)")
+    return 1.0
 
 # =========================================================
 # Swing Speed 전용 계산 함수
@@ -1258,16 +1309,20 @@ def run_from_context(ctx: dict):
                         'wrist_speed_km_h': anal['v_km_h'],
                         'wrist_speed_mph': anal['v_mph'],
                     })
+                    effective_k = float(anal.get('club_k_factor_effective', 1.35))
                     summary = {
                         'impact_frame': int(anal['impact_frame']),
                         'peak_frame': int(anal['peak_frame']),
                         'wrist_peak_km_h': float(anal['wrist_peak_kmh']),
                         'wrist_peak_mph': float(anal['wrist_peak_mph']),
-                        'club_k_factor': 1.35,
+                        'club_k_factor': effective_k,
                         'club_speed_km_h': float(anal['club_kmh']),
                         'club_speed_mph': float(anal['club_mph']),
                         'club_speed_km_h_range': [float(anal['club_kmh_range'][0]), float(anal['club_kmh_range'][1])],
                         'club_speed_mph_range': [float(anal['club_mph_range'][0]), float(anal['club_mph_range'][1])],
+                        'r_wrist_m': anal.get('r_wrist_m'),
+                        'r_head_m': anal.get('r_head_m'),
+                        'scale_r_head_over_r_wrist': anal.get('scale_r_head_over_r_wrist'),
                     }
                 else:
                     # 2D 분석 + 선택적 보정
@@ -1287,17 +1342,21 @@ def run_from_context(ctx: dict):
                             'wrist_speed_km_h': anal['v_km_h'],
                             'wrist_speed_mph': anal['v_mph'],
                         })
+                        effective_k = float(anal.get('club_k_factor_effective', 1.35))
                         summary = {
                             'impact_frame': int(anal['impact_frame']),
                             'peak_frame': int(anal['peak_frame']),
                             'wrist_peak_km_h': float(anal['wrist_peak_kmh']),
                             'wrist_peak_mph': float(anal['wrist_peak_mph']),
-                            'club_k_factor': 1.35,
+                            'club_k_factor': effective_k,
                             'club_speed_km_h': float(anal['club_kmh']),
                             'club_speed_mph': float(anal['club_mph']),
                             'club_speed_km_h_range': [float(anal['club_kmh_range'][0]), float(anal['club_kmh_range'][1])],
                             'club_speed_mph_range': [float(anal['club_mph_range'][0]), float(anal['club_mph_range'][1])],
                             'calibrated_m_per_px': float(anal['calibrated_m_per_px']),
+                            'r_wrist_m': anal.get('r_wrist_m'),
+                            'r_head_m': anal.get('r_head_m'),
+                            'scale_r_head_over_r_wrist': anal.get('scale_r_head_over_r_wrist'),
                         }
                     else:
                         N = len(anal['v_px_s'])
@@ -1589,6 +1648,7 @@ def main():
         club_kmh = anal3d['club_kmh']
         club_mph_min, club_mph_max = anal3d['club_mph_range']
         club_kmh_min, club_kmh_max = anal3d['club_kmh_range']
+        effective_k = float(anal3d.get('club_k_factor_effective', 1.35))
 
         # 조언 멘트 (평균 Head Speed 표 기준)
         advice = categorize_head_speed_mph(club_mph)
@@ -1616,7 +1676,7 @@ def main():
                         "peak_frame": int(anal3d['peak_frame']),
                         "wrist_peak_km_h": float(wrist_peak_kmh),
                         "wrist_peak_mph": float(wrist_peak_mph),
-                        "club_k_factor": 1.35,
+                        "club_k_factor": effective_k,
                         "club_speed_km_h": float(club_kmh),
                         "club_speed_mph": float(club_mph),
                         "club_speed_km_h_range": [float(club_kmh_min), float(club_kmh_max)],
@@ -1657,6 +1717,7 @@ def main():
             club_mph = anal2d['club_mph']
             club_kmh_min, club_kmh_max = anal2d['club_kmh_range']
             club_mph_min, club_mph_max = anal2d['club_mph_range']
+            effective_k = float(anal2d.get('club_k_factor_effective', 1.35))
             advice = categorize_head_speed_mph(club_mph)
             out_obj = {
                 "job_id": job_id,
@@ -1668,7 +1729,7 @@ def main():
                             "peak_frame": int(anal2d['peak_frame']),
                             "wrist_peak_km_h": float(wrist_peak_kmh),
                             "wrist_peak_mph": float(wrist_peak_mph),
-                            "club_k_factor": 1.35,
+                            "club_k_factor": effective_k,
                             "club_speed_km_h": float(club_kmh),
                             "club_speed_mph": float(club_mph),
                             "club_speed_km_h_range": [float(club_kmh_min), float(club_kmh_max)],
@@ -1730,13 +1791,15 @@ def main():
     # 콘솔 요약
     print("\n결과")
     if dim == "3d":
+        effective_k = float(anal3d.get('club_k_factor_effective', 1.35))
         print(f"실제 swing speed (손목) : {wrist_peak_kmh:.1f} km/h ({wrist_peak_mph:.1f} mph)")
-        print(f"추정 club speed (클럽) : {club_kmh:.1f} km/h ({club_mph:.1f} mph)  [k=1.35, 범위 {club_kmh_min:.1f}~{club_kmh_max:.1f} km/h]")
+        print(f"추정 club speed (클럽) : {club_kmh:.1f} km/h ({club_mph:.1f} mph)  [k={effective_k:.2f}, 범위 {club_kmh_min:.1f}~{club_kmh_max:.1f} km/h]")
         print(f"📝 조언: {advice}")
     else:
         if anal2d.get('calibrated_m_per_px'):
+            effective_k = float(anal2d.get('club_k_factor_effective', 1.35))
             print(f"실제 swing speed (손목) : {wrist_peak_kmh:.1f} km/h ({wrist_peak_mph:.1f} mph) [2D 보정]  (m_per_px={anal2d['calibrated_m_per_px']:.6f})")
-            print(f"추정 club speed (클럽) : {club_kmh:.1f} km/h ({club_mph:.1f} mph)  [k=1.35, 범위 {club_kmh_min:.1f}~{club_kmh_max:.1f} km/h]")
+            print(f"추정 club speed (클럽) : {club_kmh:.1f} km/h ({club_mph:.1f} mph)  [k={effective_k:.2f}, 범위 {club_kmh_min:.1f}~{club_kmh_max:.1f} km/h]")
             print(f"📝 조언: {advice}")
         else:
             print(f"실제 swing speed (손목) : {wrist_peak_px_s:.1f} px/s (2D, 보정 없음)")

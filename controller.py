@@ -1163,31 +1163,26 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
                                     else:
                                         Z_meter = Z_raw * depth_scale_factor
                                     
-                                    # CSV에 저장할 때는 MM 단위로: 미터 × 1000
-                                    if np.isnan(Z_meter) or not np.isfinite(Z_meter):
-                                        Z_mm = np.nan
-                                    else:
-                                        Z_mm = Z_meter * 1000.0
-                                    
-                                    sample_info['Z_median'] = None if np.isnan(Z_mm) else float(Z_mm)
+                                    # CSV에 저장할 때는 미터 단위 (swing_speed.py에서 scale_to_m=1.0으로 처리)
+                                    sample_info['Z_median'] = None if np.isnan(Z_meter) else float(Z_meter)
                                     
                                     # [DEBUG] 처음 5프레임만 로그 출력
                                     if frame_idx < 5:
-                                        print(f"[DEBUG] Frame {frame_idx}, Joint {joint_idx}: Z_raw={Z_raw:.4f}, depth_scale={depth_scale_factor}, Z_meter={Z_meter:.4f}, Z_mm={Z_mm}, sample['Z_median']={sample_info['Z_median']}")
+                                        print(f"[DEBUG] Frame {frame_idx}, Joint {joint_idx}: Z_raw={Z_raw:.4f}, depth_scale={depth_scale_factor}, Z_meter={Z_meter:.4f}, sample['Z_median']={sample_info['Z_median']}")
                                     
-                                    # Z가 유효하면 X, Y도 계산
+                                    # Z가 유효하면 X, Y도 계산 (미터 단위 Z 사용)
                                     if sample_info['Z_median'] is not None:
-                                        Zm = float(sample_info['Z_median'])  # MM 단위
+                                        Z_meter_val = float(sample_info['Z_median'])  # 미터 단위
                                         try:
                                             cx = float(intr.get('cx', 320))
                                             cy = float(intr.get('cy', 180))
                                             fx = float(intr.get('fx', 320))
                                             fy = float(intr.get('fy', 180))
-                                            # X/Y를 MM 단위로 계산
-                                            X = (x - cx) * Zm / fx
-                                            Y = (y - cy) * Zm / fy
+                                            # X/Y를 미터 단위로 계산 (unprojection: 표준 공식)
+                                            X = (x - cx) * Z_meter_val / fx
+                                            Y = (y - cy) * Z_meter_val / fy
                                             if frame_idx < 5:
-                                                print(f"[DEBUG] Frame {frame_idx}, Joint {joint_idx}: X={X:.2f}, Y={Y:.2f}, cx={cx}, cy={cy}, fx={fx}, fy={fy}")
+                                                print(f"[DEBUG] Frame {frame_idx}, Joint {joint_idx}: X={X:.4f}m, Y={Y:.4f}m, Z={Z_meter_val:.4f}m")
                                         except Exception as e:
                                             if frame_idx < 5:
                                                 print(f"[DEBUG] Frame {frame_idx}, Joint {joint_idx}: X/Y 계산 실패: {e}")
@@ -1215,7 +1210,7 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
                                 'x': float(x), 'y': float(y), 'conf': float(c),
                                 'X': x_val,
                                 'Y': y_val,
-                                'Z': z_val,
+                                'Z': z_val,  # 미터 단위
                             })
                             # record sample debug for first N frames or all (keeps small)
                             if frame_idx < 200:  # limit debug size
