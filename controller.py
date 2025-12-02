@@ -963,8 +963,8 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
                         fps = 60
                         print(f"[INFO] fps not found in intrinsics, using default={fps} (based on depth frame count={depth_count})")
                     elif fps is None:
-                        # Final fallback: use 30fps
-                        fps = 30
+                        # Final fallback: use 60fps to match system default
+                        fps = 60
                         print(f"[INFO] fps not found, using final fallback={fps}")
 
                     # record inferred scale into depth_map_info for diagnostics
