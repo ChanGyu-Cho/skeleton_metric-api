@@ -139,7 +139,7 @@ def _hampel(arr: np.ndarray, window: int, n_sigmas: float, alpha: float) -> np.n
 def _one_euro(arr: np.ndarray, fps: int, min_cutoff: float, beta: float, d_cutoff: float) -> np.ndarray:
     # https://cristal.univ-lille.fr/~casiez/1euro/
     if fps is None or fps <= 0:
-        fps = 60
+        fps = 30
     dt = 1.0 / float(fps)
 
     def alpha(fc):
@@ -302,8 +302,7 @@ def vectorized_speed_m_s_3d(points_xyz: np.ndarray, fps: int, scale_to_m: float 
     ds = np.sqrt(dx**2 + dy**2 + dz**2)
 
     ds_m = ds * float(scale_to_m)
-    # Default to 60fps when fps is missing or invalid
-    fps_float = float(fps if fps and fps > 0 else 60)
+    fps_float = float(fps if fps and fps > 0 else 30)
     v_m_s = ds_m * fps_float
     if len(v_m_s) > 0:
         v_m_s[0] = 0.0
@@ -1056,8 +1055,8 @@ def run_from_context(ctx: dict):
         job_id = str(ctx.get('job_id', ctx.get('job', 'job')))
         fps_ctx = ctx.get('fps')
         if fps_ctx is None:
-            print(f"[WARN] swing_speed.run_from_context: fps not provided, using fallback 60")
-            fps = 60
+            print(f"[WARN] swing_speed.run_from_context: fps not provided, using fallback 30")
+            fps = 30
         else:
             fps = int(fps_ctx)
 
