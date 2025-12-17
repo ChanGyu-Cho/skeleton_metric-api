@@ -64,7 +64,6 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 COPY api_server.py /opt/skeleton_metric-api/api_server.py
 COPY controller.py /opt/skeleton_metric-api/controller.py
 COPY mmaction_client.py /opt/skeleton_metric-api/mmaction_client.py
-COPY .env /opt/skeleton_metric-api/.env
 
 # Copy openpose module (exclude __pycache__)
 COPY ./openpose/*.py /opt/skeleton_metric-api/openpose/

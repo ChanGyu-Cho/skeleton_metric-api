@@ -408,16 +408,15 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
             frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
             # Extract fps from video metadata for metrics pipeline
-            # Use exact float FPS from metadata (e.g., 29.97, 59.94). Avoid int truncation.
             fps_float = cap.get(cv2.CAP_PROP_FPS)
-            fps = float(fps_float) if fps_float and fps_float > 0 else None
+            fps = int(fps_float) if fps_float > 0 else None
             cap.release()
             print(f"[INFO] Video dimensions: {frame_width}x{frame_height}")
             print(f"[DEBUG] 2D path: fps_float={fps_float}, fps={fps}")
             
             # Ensure fps has a valid value for metrics pipeline
             if fps is None or fps <= 0:
-                fps = 60.0  # Default to 60fps if not available from metadata
+                fps = 60  # Default to 60fps if not available from metadata
                 print(f"[INFO] fps not available in video metadata, using default={fps}")
             else:
                 print(f"[INFO] Extracted fps={fps} from 2D video")
@@ -712,7 +711,7 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
             try:
                 from metric_algorithm.smoothing import smooth_skeleton_wide
                 # Apply low-pass filter with cutoff 0.1, order=2, fps from video metadata
-                smoothing_fps = float(fps) if fps is not None else 60.0
+                smoothing_fps = fps if fps is not None else 30.0
                 df_2d_wide_smooth = smooth_skeleton_wide(df_2d_wide, order=2, cutoff=0.1, fps=smoothing_fps, dimension='2d')
                 df_2d_wide = df_2d_wide_smooth
                 print("[INFO] Applied Butterworth smoothing to 2D skeleton")
@@ -949,13 +948,8 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
                                 # Extract fps if present (used by metrics modules for overlay MP4 generation)
                                 if 'fps' in meta:
                                     try:
-                                        # Preserve float fps if provided (e.g., 59.94)
-                                        val = meta.get('fps')
-                                        fps = float(val) if val is not None else None
-                                        if fps and fps > 0:
-                                            print(f"[INFO] Extracted fps={fps} from intrinsics.json meta")
-                                        else:
-                                            fps = None
+                                        fps = int(meta.get('fps'))
+                                        print(f"[INFO] Extracted fps={fps} from intrinsics.json meta")
                                     except Exception as e:
                                         print(f"[WARN] Failed to parse fps from meta: {e}")
                     except Exception:
@@ -966,11 +960,11 @@ def process_and_save(s3_key: str, dimension: str, job_id: str, turbo_without_ske
                     if fps is None and depth_count > 0:
                         # Estimate fps: assume 60fps for depth-based recordings (common for RealSense D455)
                         # This is a reasonable default that matches typical depth recorder fps
-                        fps = 60.0
+                        fps = 60
                         print(f"[INFO] fps not found in intrinsics, using default={fps} (based on depth frame count={depth_count})")
                     elif fps is None:
-                        # Final fallback: use 60fps to match system default
-                        fps = 60.0
+                        # Final fallback: use 30fps
+                        fps = 30
                         print(f"[INFO] fps not found, using final fallback={fps}")
 
                     # record inferred scale into depth_map_info for diagnostics
