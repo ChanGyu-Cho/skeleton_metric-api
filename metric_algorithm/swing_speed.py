@@ -687,20 +687,8 @@ def analyze_wrist_speed_3d(df: pd.DataFrame, fps: int, wrist: str = "RWrist", sc
         q1 = np.percentile(valid_speeds, 25)
         q3 = np.percentile(valid_speeds, 75)
         iqr = q3 - q1
-        # Relax the abnormal threshold to reduce excessive peak suppression
-        speed_upper_bound = q3 + 4.0 * iqr
+        speed_upper_bound = q3 + 3.0 * iqr
         abnormal_mask = v_kmh > speed_upper_bound
-        # Do not suppress within impact neighborhood (retain local peak signal)
-        try:
-            impact_frame_est = detect_impact_by_crossing(df, prefer_2d=False, skip_ratio=0.0, smooth_window=3, hold_frames=0, margin=0.0)
-        except Exception:
-            impact_frame_est = None
-        if impact_frame_est is not None and isinstance(impact_frame_est, (int, np.integer)):
-            lo_safe = max(0, int(impact_frame_est) - 2)
-            hi_safe = min(len(v_kmh) - 1, int(impact_frame_est) + 2)
-            safe_mask = np.zeros_like(abnormal_mask, dtype=bool)
-            safe_mask[lo_safe:hi_safe+1] = True
-            abnormal_mask = abnormal_mask & (~safe_mask)
         n_abnormal = np.sum(abnormal_mask)
         if n_abnormal > 0:
             abnormal_frames = np.where(abnormal_mask)[0]
